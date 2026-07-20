@@ -8,38 +8,36 @@ from core.context import AppContext
 from steps.base import LogFn, StepResult, TestStep, shell_ok
 
 
-class DockerGroupStep(TestStep):
+class DockerSetupStep(TestStep):
+    """原文档：加入 docker 组 → 写 daemon.json → 重启 docker，合并为一步。"""
+
     def __init__(self) -> None:
         super().__init__(
-            id="env_docker_group",
-            title="加入 docker 用户组",
-            description="sudo usermod -aG docker $USER（需重新登录/newgrp 后生效）",
+            id="env_docker_setup",
+            title="配置 Docker（用户组 / 镜像源 / 重启）",
+            description=(
+                "1) usermod -aG docker  2) 写入 daemon.json（registry-mirrors / nvidia）"
+                "  3) systemctl daemon-reload && restart docker"
+            ),
             category="env",
             dangerous=True,
         )
 
     def run(self, ctx: AppContext, log: LogFn) -> StepResult:
+        logs: list[str] = []
         user = ctx.dc.get("user", "anyverse")
-        return shell_ok(
-            ctx,
+
+        log("—— 1/3 加入 docker 用户组 ——")
+        res1 = ctx.ssh.exec_host(
             f"sudo usermod -aG docker {user} && groups {user}",
-            log,
-            docker=False,
+            log=log,
             timeout=60,
         )
+        logs.append(res1.combined)
+        if not res1.ok:
+            return StepResult(False, f"加入 docker 组失败 (exit={res1.exit_code})", "\n".join(logs))
 
-
-class DockerDaemonStep(TestStep):
-    def __init__(self) -> None:
-        super().__init__(
-            id="env_docker_daemon",
-            title="配置 Docker 仓库镜像",
-            description="写入 /etc/docker/daemon.json（registry-mirrors / nvidia runtime）",
-            category="env",
-            dangerous=True,
-        )
-
-    def run(self, ctx: AppContext, log: LogFn) -> StepResult:
+        log("—— 2/3 配置 Docker 仓库镜像 ——")
         d = ctx.config.get("docker", {})
         payload = {
             "registry-mirrors": d.get("registry_mirrors", []),
@@ -53,28 +51,25 @@ class DockerDaemonStep(TestStep):
         }
         content = json.dumps(payload, indent=4, ensure_ascii=False) + "\n"
         path = d.get("daemon_json_path", "/etc/docker/daemon.json")
-        res = ctx.ssh.write_remote_file(path, content, sudo=True, log=log)
-        if not res.ok:
-            return StepResult(False, f"写入 daemon.json 失败: {res.combined}", res.combined)
-        return StepResult(True, "daemon.json 已更新", res.combined)
+        res2 = ctx.ssh.write_remote_file(path, content, sudo=True, log=log)
+        logs.append(res2.combined)
+        if not res2.ok:
+            return StepResult(False, f"写入 daemon.json 失败: {res2.combined}", "\n".join(logs))
 
-
-class DockerRestartStep(TestStep):
-    def __init__(self) -> None:
-        super().__init__(
-            id="env_docker_restart",
-            title="重启 Docker",
-            description="systemctl daemon-reload && restart docker",
-            category="env",
-            dangerous=True,
-        )
-
-    def run(self, ctx: AppContext, log: LogFn) -> StepResult:
-        return shell_ok(
-            ctx,
+        log("—— 3/3 重启 Docker ——")
+        res3 = ctx.ssh.exec_host(
             "sudo systemctl daemon-reload && sudo systemctl restart docker && sudo systemctl is-active docker",
-            log,
+            log=log,
             timeout=120,
+        )
+        logs.append(res3.combined)
+        if not res3.ok:
+            return StepResult(False, f"重启 Docker 失败 (exit={res3.exit_code})", "\n".join(logs))
+
+        return StepResult(
+            True,
+            "Docker 用户组、镜像源已配置并已重启（用户组需重新登录/newgrp 后完全生效）",
+            "\n".join(logs),
         )
 
 
@@ -344,9 +339,7 @@ class MockGripperStep(TestStep):
 
 
 ENV_STEPS = [
-    DockerGroupStep(),
-    DockerDaemonStep(),
-    DockerRestartStep(),
+    DockerSetupStep(),
     GitlabSshStep(),
     CloneCodeStep(),
     CameraInitStep(),
