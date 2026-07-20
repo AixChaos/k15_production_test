@@ -28,19 +28,19 @@ python main.py
 
 ## 使用流程
 
-1. 填写域控 IP / 用户 / 密码或私钥，点击「连接」
-2. 「环境配置」页：Docker、Git、相机、编译等（危险步骤有二次确认）
-3. 「生产测试」页：底盘话题、DDS、Talker/Listener、Controller、关节时延等
-4. 选中步骤 → 「执行本步骤」→ 右侧看实时日志
-5. 需人工核对的步骤（Camera SN、夹爪 Mock、时延）执行后点「人工确认通过」
+1. 启动后自动填充本机网线 IP，本机账号默认 `wujie` / `123456`
+2. **手动填写域控 IP**，域控账号默认 `nvidia` / `nvidia`，点击「连接域控」
+3. 文件传输：先「1. 选择本地文件」，再「2. 选择域控路径并传输」（无写权限时自动 sudo）
+4. 「环境配置」/「生产测试」页：选中步骤 →「执行本步骤」→ 右侧看日志
+5. 需人工核对的步骤执行后点「人工确认通过」
 6. 「导出报告」生成 `reports/k15_test_report_*.json`
 
 ## 配置
 
 编辑或在界面「保存配置」写入 `config/default.yaml`：
 
-- `domain_controller.host` / `user` / `host_work_dir` / `container_name`
-- `pc.ip`：写入域控 `cyclonedds.xml` 的 Peer（上位机 IP）
+- `domain_controller.host`（需手动填）/ `user`（默认 nvidia）/ `host_work_dir` / `container_name`
+- `pc.ip`：启动时自动探测网线 IP，用于 DDS Peer
 - `ros.domain_id`（默认 40）、`network_interface`（文档示例 `eth5`）
 
 ## 说明

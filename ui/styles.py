@@ -14,14 +14,21 @@ QTabWidget::pane {
 QTabBar::tab {
     background: #252a33;
     color: #9aa0a6;
-    padding: 8px 18px;
+    padding: 10px 22px;
     margin-right: 2px;
     border-top-left-radius: 6px;
     border-top-right-radius: 6px;
+    font-weight: 600;
 }
 QTabBar::tab:selected {
     background: #2d333b;
     color: #e8eaed;
+}
+QTabWidget#mainTabs::pane {
+    border: 1px solid #2d333b;
+    border-radius: 6px;
+    top: -1px;
+    padding: 4px;
 }
 QLineEdit, QSpinBox, QComboBox {
     background: #0f1115;

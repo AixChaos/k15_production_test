@@ -1,11 +1,13 @@
 """主窗口：连接域控、分步点击执行、日志与报告。"""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, Signal, Slot
 from PySide6.QtGui import QColor, QTextCursor
 from PySide6.QtWidgets import (
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -26,9 +28,11 @@ from PySide6.QtWidgets import (
 
 from core.config import ROOT, load_config, save_config
 from core.context import AppContext, write_report
+from core.netinfo import get_wired_ipv4
 from core.ssh_client import SshClient
 from steps import all_steps, steps_by_category
 from steps.base import StepResult, StepStatus, TestStep
+from ui.remote_path_dialog import RemotePathDialog
 from ui.styles import APP_QSS, STATUS_COLORS
 
 
@@ -65,6 +69,7 @@ class MainWindow(QMainWindow):
         self.ssh: Optional[SshClient] = None
         self.worker: Optional[StepWorker] = None
         self._busy = False
+        self._local_file: str = ""
 
         self._build_ui()
         self._load_fields_from_config()
@@ -78,7 +83,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
-        # Header
+        # Header（两页共用）
         header = QHBoxLayout()
         title = QLabel("K15 域控生产测试上位机")
         title.setObjectName("title")
@@ -90,42 +95,93 @@ class MainWindow(QMainWindow):
         layout.addLayout(header)
 
         hint = QLabel(
-            "适配 Ubuntu 22.04 · 本机仅显示日志 · 所有命令经 SSH + docker exec 在域控执行 · 每步可单独点击执行"
+            "页面1：连接配置与文件传输 · 页面2：环境配置与生产测试 · 本机仅显示日志，命令经 SSH + docker exec 执行"
         )
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        # Connection bar
-        conn_box = QGroupBox("域控连接")
+        # 顶层两个页面
+        self.main_tabs = QTabWidget()
+        self.main_tabs.setObjectName("mainTabs")
+        self.main_tabs.addTab(self._build_page_connection(), "1. 连接配置")
+        self.main_tabs.addTab(self._build_page_tests(), "2. 环境与测试")
+        layout.addWidget(self.main_tabs, 1)
+
+        self.btn_refresh_ip.clicked.connect(self.on_refresh_pc_ip)
+        self.btn_connect.clicked.connect(self.on_connect)
+        self.btn_disconnect.clicked.connect(self.on_disconnect)
+        self.btn_save_cfg.clicked.connect(self.on_save_config)
+        self.btn_pick_local.clicked.connect(self.on_pick_local_file)
+        self.btn_xfer.clicked.connect(self.on_transfer_file)
+        self.btn_run.clicked.connect(self.on_run_step)
+        self.btn_manual.clicked.connect(self.on_manual_pass)
+        self.btn_skip.clicked.connect(self.on_skip)
+        self.btn_reset.clicked.connect(self.on_reset)
+        self.btn_export.clicked.connect(self.on_export)
+        self.env_list.currentItemChanged.connect(self.on_selection_changed)
+        self.test_list.currentItemChanged.connect(self.on_selection_changed)
+        self.step_tabs.currentChanged.connect(lambda _: self.on_selection_changed())
+
+    def _build_page_connection(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 12, 8, 8)
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+
+        form_host = QWidget()
+        form_l = QVBoxLayout(form_host)
+        form_l.setContentsMargins(0, 0, 0, 0)
+
+        conn_box = QGroupBox("连接配置")
         form = QFormLayout(conn_box)
+
+        # —— 本机 ——
+        self.pc_ip_edit = QLineEdit()
+        self.pc_ip_edit.setReadOnly(True)
+        self.pc_user_edit = QLineEdit("wujie")
+        self.pc_password_edit = QLineEdit("123456")
+        self.pc_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.btn_refresh_ip = QPushButton("刷新网线 IP")
+        self.btn_refresh_ip.setObjectName("ghost")
+        pc_ip_row = QHBoxLayout()
+        pc_ip_row.addWidget(self.pc_ip_edit, 1)
+        pc_ip_row.addWidget(self.btn_refresh_ip)
+        form.addRow(QLabel("<b>本机</b>"))
+        form.addRow("网线 IP", pc_ip_row)
+        form.addRow("用户名", self.pc_user_edit)
+        form.addRow("密码", self.pc_password_edit)
+
+        # —— 域控 ——
         self.host_edit = QLineEdit()
+        self.host_edit.setPlaceholderText("请手动填写目标域控 IP")
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
-        self.user_edit = QLineEdit()
-        self.password_edit = QLineEdit()
+        self.port_spin.setValue(22)
+        self.user_edit = QLineEdit("nvidia")
+        self.password_edit = QLineEdit("nvidia")
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.key_edit = QLineEdit()
-        self.key_edit.setPlaceholderText("可选：私钥路径，留空用 ssh-agent/默认密钥")
+        self.key_edit.setPlaceholderText("可选：私钥路径，留空用密码登录")
         self.container_edit = QLineEdit()
         self.container_edit.setPlaceholderText("可选：容器名，留空自动匹配")
         self.work_edit = QLineEdit()
-        self.pc_ip_edit = QLineEdit()
         self.domain_spin = QSpinBox()
         self.domain_spin.setRange(0, 101)
         self.iface_edit = QLineEdit()
 
-        row1 = QHBoxLayout()
-        row1.addWidget(self.host_edit, 3)
-        row1.addWidget(QLabel("端口"))
-        row1.addWidget(self.port_spin)
-        form.addRow("主机", row1)
-        form.addRow("用户", self.user_edit)
+        form.addRow(QLabel("<b>目标域控</b>"))
+        host_row = QHBoxLayout()
+        host_row.addWidget(self.host_edit, 3)
+        host_row.addWidget(QLabel("端口"))
+        host_row.addWidget(self.port_spin)
+        form.addRow("域控 IP", host_row)
+        form.addRow("用户名", self.user_edit)
         form.addRow("密码", self.password_edit)
         form.addRow("私钥", self.key_edit)
         form.addRow("容器名", self.container_edit)
         form.addRow("宿主机仓库", self.work_edit)
-        form.addRow("上位机 IP", self.pc_ip_edit)
         row_ros = QHBoxLayout()
         row_ros.addWidget(self.domain_spin)
         row_ros.addWidget(QLabel("DDS 网卡"))
@@ -133,7 +189,7 @@ class MainWindow(QMainWindow):
         form.addRow("DOMAIN_ID", row_ros)
 
         btn_row = QHBoxLayout()
-        self.btn_connect = QPushButton("连接")
+        self.btn_connect = QPushButton("连接域控")
         self.btn_connect.setObjectName("success")
         self.btn_disconnect = QPushButton("断开")
         self.btn_disconnect.setObjectName("ghost")
@@ -144,24 +200,69 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_save_cfg)
         btn_row.addStretch()
         form.addRow(btn_row)
-        layout.addWidget(conn_box)
 
-        self.btn_connect.clicked.connect(self.on_connect)
-        self.btn_disconnect.clicked.connect(self.on_disconnect)
-        self.btn_save_cfg.clicked.connect(self.on_save_config)
+        # —— 文件传输 ——
+        form.addRow(QLabel("<b>文件传输</b>（本机 → 域控）"))
+        self.local_file_edit = QLineEdit()
+        self.local_file_edit.setReadOnly(True)
+        self.local_file_edit.setPlaceholderText("尚未选择本地文件")
+        xfer_row1 = QHBoxLayout()
+        self.btn_pick_local = QPushButton("1. 选择本地文件")
+        xfer_row1.addWidget(self.local_file_edit, 1)
+        xfer_row1.addWidget(self.btn_pick_local)
+        form.addRow("本地文件", xfer_row1)
+
+        self.remote_path_edit = QLineEdit()
+        self.remote_path_edit.setPlaceholderText("域控目标路径（按钮 2 可浏览选择并自动传输）")
+        xfer_row2 = QHBoxLayout()
+        self.btn_xfer = QPushButton("2. 选择域控路径并传输")
+        self.btn_xfer.setObjectName("success")
+        xfer_row2.addWidget(self.remote_path_edit, 1)
+        xfer_row2.addWidget(self.btn_xfer)
+        form.addRow("域控路径", xfer_row2)
+
+        form_l.addWidget(conn_box)
+        form_l.addStretch()
+        splitter.addWidget(form_host)
+
+        # 页面1 日志
+        log_host = QWidget()
+        log_l = QVBoxLayout(log_host)
+        log_l.setContentsMargins(0, 0, 0, 0)
+        log_l.addWidget(QLabel("连接 / 传输日志"))
+        self.conn_log_view = QTextEdit()
+        self.conn_log_view.setReadOnly(True)
+        log_l.addWidget(self.conn_log_view, 1)
+        btn_clear_conn = QPushButton("清空日志")
+        btn_clear_conn.setObjectName("ghost")
+        btn_clear_conn.clicked.connect(self.conn_log_view.clear)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(btn_clear_conn)
+        log_l.addLayout(row)
+        splitter.addWidget(log_host)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
+        layout.addWidget(splitter)
+        return page
+
+    def _build_page_tests(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 12, 8, 8)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Left: tabs with step lists
         left = QWidget()
         left_l = QVBoxLayout(left)
         left_l.setContentsMargins(0, 0, 0, 0)
-        self.tabs = QTabWidget()
+        self.step_tabs = QTabWidget()
         self.env_list = QListWidget()
         self.test_list = QListWidget()
-        self.tabs.addTab(self.env_list, "环境配置")
-        self.tabs.addTab(self.test_list, "生产测试")
-        left_l.addWidget(self.tabs)
+        self.step_tabs.addTab(self.env_list, "环境配置")
+        self.step_tabs.addTab(self.test_list, "生产测试")
+        left_l.addWidget(self.step_tabs)
 
         self.progress_label = QLabel("进度: 0 / 0 通过")
         left_l.addWidget(self.progress_label)
@@ -183,16 +284,8 @@ class MainWindow(QMainWindow):
         self.btn_export = QPushButton("导出报告")
         act2.addWidget(self.btn_export)
         left_l.addLayout(act2)
-
-        self.btn_run.clicked.connect(self.on_run_step)
-        self.btn_manual.clicked.connect(self.on_manual_pass)
-        self.btn_skip.clicked.connect(self.on_skip)
-        self.btn_reset.clicked.connect(self.on_reset)
-        self.btn_export.clicked.connect(self.on_export)
-
         splitter.addWidget(left)
 
-        # Right: detail + log
         right = QWidget()
         right_l = QVBoxLayout(right)
         right_l.setContentsMargins(0, 0, 0, 0)
@@ -217,24 +310,29 @@ class MainWindow(QMainWindow):
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
-        layout.addWidget(splitter, 1)
 
-        self.env_list.currentItemChanged.connect(self.on_selection_changed)
-        self.test_list.currentItemChanged.connect(self.on_selection_changed)
-        self.tabs.currentChanged.connect(lambda _: self.on_selection_changed())
+        layout.addWidget(splitter)
+        return page
 
     def _load_fields_from_config(self) -> None:
         dc = self.config.get("domain_controller", {})
         pc = self.config.get("pc", {})
         ros = self.config.get("ros", {})
+
+        # 本机：自动探测网线 IP + 默认账号
+        wired = get_wired_ipv4()
+        self.pc_ip_edit.setText(wired or str(pc.get("ip", "")))
+        self.pc_user_edit.setText(str(pc.get("user", "wujie") or "wujie"))
+        self.pc_password_edit.setText(str(pc.get("password", "123456") or "123456"))
+
+        # 域控：IP 留空需手动填；默认 nvidia/nvidia
         self.host_edit.setText(str(dc.get("host", "")))
         self.port_spin.setValue(int(dc.get("port", 22)))
-        self.user_edit.setText(str(dc.get("user", "anyverse")))
-        self.password_edit.setText(str(dc.get("password", "")))
+        self.user_edit.setText(str(dc.get("user", "nvidia") or "nvidia"))
+        self.password_edit.setText(str(dc.get("password", "nvidia") or "nvidia"))
         self.key_edit.setText(str(dc.get("key_filename", "")))
         self.container_edit.setText(str(dc.get("container_name", "")))
-        self.work_edit.setText(str(dc.get("host_work_dir", "")))
-        self.pc_ip_edit.setText(str(pc.get("ip", "")))
+        self.work_edit.setText(str(dc.get("host_work_dir", "/home/nvidia/work/anyverse")))
         self.domain_spin.setValue(int(ros.get("domain_id", 40)))
         self.iface_edit.setText(str(ros.get("network_interface", "eth5")))
 
@@ -246,19 +344,21 @@ class MainWindow(QMainWindow):
             {
                 "host": self.host_edit.text().strip(),
                 "port": self.port_spin.value(),
-                "user": self.user_edit.text().strip(),
-                "password": self.password_edit.text(),
+                "user": self.user_edit.text().strip() or "nvidia",
+                "password": self.password_edit.text() or "nvidia",
                 "key_filename": self.key_edit.text().strip(),
                 "container_name": self.container_edit.text().strip(),
                 "host_work_dir": self.work_edit.text().strip(),
             }
         )
         self.config["pc"]["ip"] = self.pc_ip_edit.text().strip()
+        self.config["pc"]["user"] = self.pc_user_edit.text().strip() or "wujie"
+        self.config["pc"]["password"] = self.pc_password_edit.text() or "123456"
         self.config["ros"]["domain_id"] = self.domain_spin.value()
         self.config["ros"]["network_interface"] = self.iface_edit.text().strip()
 
     def _current_list(self) -> QListWidget:
-        return self.env_list if self.tabs.currentIndex() == 0 else self.test_list
+        return self.env_list if self.step_tabs.currentIndex() == 0 else self.test_list
 
     def _current_step(self) -> Optional[TestStep]:
         item = self._current_list().currentItem()
@@ -317,8 +417,11 @@ class MainWindow(QMainWindow):
         self.conn_label.style().polish(self.conn_label)
 
     def append_log(self, msg: str) -> None:
-        self.log_view.append(msg)
-        self.log_view.moveCursor(QTextCursor.MoveOperation.End)
+        for view in (getattr(self, "conn_log_view", None), getattr(self, "log_view", None)):
+            if view is None:
+                continue
+            view.append(msg)
+            view.moveCursor(QTextCursor.MoveOperation.End)
 
     def make_ctx(self) -> AppContext:
         if not self.ssh or not self.ssh.connected:
@@ -345,19 +448,75 @@ class MainWindow(QMainWindow):
         self.detail_desc.setText(step.description + ("\n" + "\n".join(extra) if extra else ""))
 
     @Slot()
+    def on_refresh_pc_ip(self) -> None:
+        ip = get_wired_ipv4()
+        self.pc_ip_edit.setText(ip)
+        if ip:
+            self.append_log(f"本机网线 IP: {ip}")
+        else:
+            self.append_log("未检测到有线网卡 IP，请检查网线是否已连接")
+            QMessageBox.warning(self, "本机 IP", "未检测到有线网卡 IP")
+
+    @Slot()
+    def on_pick_local_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "选择本地文件", str(Path.home()), "所有文件 (*)")
+        if not path:
+            return
+        self._local_file = path
+        self.local_file_edit.setText(path)
+        self.append_log(f"已选择本地文件: {path}")
+
+    @Slot()
+    def on_transfer_file(self) -> None:
+        if not self._local_file or not Path(self._local_file).is_file():
+            QMessageBox.information(self, "提示", "请先点击「1. 选择本地文件」")
+            return
+        if not self.ssh or not self.ssh.connected:
+            QMessageBox.warning(self, "未连接", "请先连接域控后再传输文件")
+            return
+
+        start = self.remote_path_edit.text().strip() or f"/home/{self.user_edit.text().strip() or 'nvidia'}"
+        dlg = RemotePathDialog(self.ssh, start_path=start, parent=self)
+        # 预填本地文件名
+        dlg.file_name_edit.setText(Path(self._local_file).name)
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+
+        remote = dlg.selected_path()
+        self.remote_path_edit.setText(remote)
+        self.append_log(f"\n======== 文件传输 ========\n本地: {self._local_file}\n域控: {remote}")
+        try:
+            res = self.ssh.upload_local_file(self._local_file, remote, log=self.append_log)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "传输失败", str(exc))
+            self.append_log(f"[FAIL] 传输异常: {exc}")
+            return
+        if res.ok:
+            self.append_log(f"[PASS] 已传输到 {remote}")
+            QMessageBox.information(self, "传输成功", f"已上传到域控:\n{remote}")
+        else:
+            self.append_log(f"[FAIL] 传输失败: {res.combined}")
+            QMessageBox.critical(self, "传输失败", res.combined or "未知错误")
+
+    @Slot()
     def on_connect(self) -> None:
+        host = self.host_edit.text().strip()
+        if not host:
+            QMessageBox.warning(self, "域控 IP", "请手动填写目标域控 IP")
+            self.host_edit.setFocus()
+            return
         self._apply_fields_to_config()
         dc = self.config["domain_controller"]
         try:
             client = SshClient(
                 host=dc["host"],
                 port=int(dc.get("port", 22)),
-                user=dc.get("user", "anyverse"),
+                user=dc.get("user", "nvidia") or "nvidia",
                 password=dc.get("password", "") or "",
                 key_filename=dc.get("key_filename", "") or "",
                 container_name=dc.get("container_name", "") or "",
                 container_work_dir=dc.get("container_work_dir", "/anyverse"),
-                host_work_dir=dc.get("host_work_dir", "/home/anyverse/work/anyverse"),
+                host_work_dir=dc.get("host_work_dir", "/home/nvidia/work/anyverse"),
             )
             client.connect(log=self.append_log)
             # 探测容器

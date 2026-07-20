@@ -1,7 +1,6 @@
 """SSH + docker exec 远程执行。"""
 from __future__ import annotations
 
-import socket
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -211,7 +210,7 @@ class SshClient:
             with sftp.file(tmp, "w") as f:
                 f.write(content)
             if sudo:
-                cmd = f"sudo mv {tmp} {remote_path} && sudo chmod 644 {remote_path}"
+                cmd = self._sudo_cmd(f"mv {tmp} {remote_path} && chmod 644 {remote_path}")
             else:
                 cmd = f"mv {tmp} {remote_path}"
             return self.exec_host(cmd, log=log, timeout=60)
@@ -220,6 +219,107 @@ class SshClient:
                 sftp.close()
             except Exception:
                 pass
+
+    def _sudo_cmd(self, command: str) -> str:
+        """用当前密码非交互提权；无密码则直接 sudo。"""
+        if self.password:
+            # -S 从 stdin 读密码；-p '' 避免提示干扰
+            escaped = self.password.replace("'", "'\"'\"'")
+            return f"printf '%s\\n' '{escaped}' | sudo -S -p '' {command}"
+        return f"sudo -n {command}"
+
+    def list_remote_dir(self, remote_dir: str) -> list[tuple[str, bool]]:
+        """返回 [(name, is_dir), ...]。"""
+        client = self.ensure()
+        sftp = client.open_sftp()
+        try:
+            entries: list[tuple[str, bool]] = []
+            for attr in sftp.listdir_attr(remote_dir):
+                name = attr.filename
+                if name in (".", ".."):
+                    continue
+                is_dir = False
+                try:
+                    import stat as statmod
+
+                    is_dir = statmod.S_ISDIR(attr.st_mode or 0)
+                except Exception:
+                    is_dir = False
+                entries.append((name, is_dir))
+            entries.sort(key=lambda x: (not x[1], x[0].lower()))
+            return entries
+        finally:
+            sftp.close()
+
+    def upload_local_file(
+        self,
+        local_path: str,
+        remote_path: str,
+        log: LogFn | None = None,
+    ) -> ExecResult:
+        """上传本地文件到域控；目标目录无写权限时自动 sudo 提权放置。"""
+        import os
+        from pathlib import Path
+
+        local = Path(local_path)
+        if not local.is_file():
+            raise FileNotFoundError(f"本地文件不存在: {local_path}")
+
+        remote_path = remote_path.strip()
+        if remote_path.endswith("/"):
+            remote_path = remote_path + local.name
+        # 若目标是已有目录，拼文件名
+        probe = self.exec_host(
+            f'test -d "{remote_path}" && echo ISDIR || true',
+            log=None,
+            timeout=30,
+        )
+        if "ISDIR" in probe.combined:
+            remote_path = remote_path.rstrip("/") + "/" + local.name
+
+        client = self.ensure()
+        sftp = client.open_sftp()
+        tmp = f"/tmp/k15_xfer_{int(time.time() * 1000)}_{local.name}"
+        try:
+            if log:
+                log(f"上传 {local} -> 临时文件 {tmp}")
+            sftp.put(str(local), tmp)
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
+        parent = os.path.dirname(remote_path) or "/"
+        # 先尝试普通用户移动
+        if log:
+            log(f"放置到目标: {remote_path}")
+        res = self.exec_host(
+            f'mkdir -p "{parent}" 2>/dev/null; mv "{tmp}" "{remote_path}" && chmod 644 "{remote_path}" && ls -la "{remote_path}"',
+            log=log,
+            timeout=120,
+        )
+        if res.ok:
+            return res
+
+        if log:
+            log("普通权限失败，尝试 sudo/root 提权传输 ...")
+        # 清理可能残留
+        self.exec_host(f'rm -f "{remote_path}" 2>/dev/null || true', log=None, timeout=30)
+        # 若第一次 mv 已失败，临时文件可能还在
+        still = self.exec_host(f'test -f "{tmp}" && echo OK || echo MISSING', log=None, timeout=30)
+        if "MISSING" in still.combined:
+            # 重新上传到临时路径
+            sftp = client.open_sftp()
+            try:
+                sftp.put(str(local), tmp)
+            finally:
+                sftp.close()
+
+        cmd = self._sudo_cmd(
+            f'mkdir -p "{parent}" && mv "{tmp}" "{remote_path}" && chmod 644 "{remote_path}" && ls -la "{remote_path}"'
+        )
+        return self.exec_host(cmd, log=log, timeout=120)
 
     def read_remote_file(self, remote_path: str) -> str:
         client = self.ensure()
@@ -232,11 +332,6 @@ class SshClient:
 
     @staticmethod
     def local_ip_guess() -> str:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except Exception:
-            return "127.0.0.1"
+        from core.netinfo import get_wired_ipv4
+
+        return get_wired_ipv4() or "127.0.0.1"
