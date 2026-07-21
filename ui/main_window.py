@@ -7,6 +7,7 @@ from typing import Optional
 from PySide6.QtCore import Qt, QThread, Signal, Slot
 from PySide6.QtGui import QColor, QTextCursor
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -114,6 +115,7 @@ class MainWindow(QMainWindow):
         self.btn_save_cfg.clicked.connect(self.on_save_config)
         self.btn_pick_local.clicked.connect(self.on_pick_local_file)
         self.btn_xfer.clicked.connect(self.on_transfer_file)
+        self.host_edit.lineEdit().editingFinished.connect(self.on_host_editing_finished)
         self.btn_run.clicked.connect(self.on_run_step)
         self.btn_manual.clicked.connect(self.on_manual_pass)
         self.btn_skip.clicked.connect(self.on_skip)
@@ -140,9 +142,6 @@ class MainWindow(QMainWindow):
         # —— 本机 ——
         self.pc_ip_edit = QLineEdit()
         self.pc_ip_edit.setReadOnly(True)
-        self.pc_user_edit = QLineEdit("wujie")
-        self.pc_password_edit = QLineEdit("123456")
-        self.pc_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.btn_refresh_ip = QPushButton("刷新网线 IP")
         self.btn_refresh_ip.setObjectName("ghost")
         pc_ip_row = QHBoxLayout()
@@ -150,23 +149,19 @@ class MainWindow(QMainWindow):
         pc_ip_row.addWidget(self.btn_refresh_ip)
         form.addRow(QLabel("<b>本机</b>"))
         form.addRow("网线 IP", pc_ip_row)
-        form.addRow("用户名", self.pc_user_edit)
-        form.addRow("密码", self.pc_password_edit)
 
         # —— 域控 ——
-        self.host_edit = QLineEdit()
-        self.host_edit.setPlaceholderText("请手动填写目标域控 IP")
+        self.host_edit = QComboBox()
+        self.host_edit.setEditable(True)
+        self.host_edit.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.host_edit.setMaxCount(30)
+        self.host_edit.lineEdit().setPlaceholderText("请手动填写目标域控 IP（填写后自动记住）")
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
         self.port_spin.setValue(22)
         self.user_edit = QLineEdit("nvidia")
         self.password_edit = QLineEdit("nvidia")
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key_edit = QLineEdit()
-        self.key_edit.setPlaceholderText("可选：私钥路径，留空用密码登录")
-        self.container_edit = QLineEdit()
-        self.container_edit.setPlaceholderText("可选：容器名，留空自动匹配")
-        self.work_edit = QLineEdit()
         self.domain_spin = QSpinBox()
         self.domain_spin.setRange(0, 101)
         self.iface_edit = QLineEdit()
@@ -179,9 +174,6 @@ class MainWindow(QMainWindow):
         form.addRow("域控 IP", host_row)
         form.addRow("用户名", self.user_edit)
         form.addRow("密码", self.password_edit)
-        form.addRow("私钥", self.key_edit)
-        form.addRow("容器名", self.container_edit)
-        form.addRow("宿主机仓库", self.work_edit)
         row_ros = QHBoxLayout()
         row_ros.addWidget(self.domain_spin)
         row_ros.addWidget(QLabel("DDS 网卡"))
@@ -314,25 +306,88 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter)
         return page
 
+    def _host_text(self) -> str:
+        return self.host_edit.currentText().strip()
+
+    def _set_host_text(self, host: str) -> None:
+        """设置当前 IP，不主动清空已有内容。"""
+        host = (host or "").strip()
+        if not host:
+            return
+        # 阻断信号，避免填充历史时触发多余保存
+        self.host_edit.blockSignals(True)
+        idx = self.host_edit.findText(host)
+        if idx < 0:
+            self.host_edit.insertItem(0, host)
+            idx = 0
+        self.host_edit.setCurrentIndex(idx)
+        self.host_edit.setEditText(host)
+        self.host_edit.blockSignals(False)
+
+    def _load_host_history(self) -> None:
+        dc = self.config.get("domain_controller", {})
+        history = dc.get("host_history") or []
+        if not isinstance(history, list):
+            history = []
+        last = str(dc.get("host", "") or "").strip()
+        # 合并：last 优先，去重保序
+        merged: list[str] = []
+        for item in [last, *[str(x).strip() for x in history]]:
+            if item and item not in merged:
+                merged.append(item)
+        self.host_edit.blockSignals(True)
+        self.host_edit.clear()
+        for ip in merged:
+            self.host_edit.addItem(ip)
+        if merged:
+            self.host_edit.setCurrentIndex(0)
+            self.host_edit.setEditText(merged[0])
+        else:
+            # 无历史时保持空，等待用户填写；不强制清空已有编辑内容
+            self.host_edit.setEditText("")
+        self.host_edit.blockSignals(False)
+
+    def _remember_host(self, persist: bool = True) -> str:
+        """记录当前域控 IP 到历史，并写回配置（不会用空值覆盖已有 host）。"""
+        host = self._host_text()
+        dc = self.config.setdefault("domain_controller", {})
+        history = [str(x).strip() for x in (dc.get("host_history") or []) if str(x).strip()]
+        if host:
+            history = [host, *[h for h in history if h != host]]
+            dc["host"] = host
+            dc["host_history"] = history[:20]
+            # 更新下拉，当前项置顶
+            self.host_edit.blockSignals(True)
+            existing = [self.host_edit.itemText(i) for i in range(self.host_edit.count())]
+            if host not in existing:
+                self.host_edit.insertItem(0, host)
+            else:
+                idx = self.host_edit.findText(host)
+                if idx > 0:
+                    self.host_edit.removeItem(idx)
+                    self.host_edit.insertItem(0, host)
+            self.host_edit.setCurrentIndex(0)
+            self.host_edit.setEditText(host)
+            self.host_edit.blockSignals(False)
+            if persist:
+                save_config(self.config)
+        # 空输入：不写回空 host，保留配置里上次的值
+        return host
+
     def _load_fields_from_config(self) -> None:
         dc = self.config.get("domain_controller", {})
         pc = self.config.get("pc", {})
         ros = self.config.get("ros", {})
 
-        # 本机：自动探测网线 IP + 默认账号
+        # 本机：自动探测网线 IP（不影响域控 IP）
         wired = get_wired_ipv4()
         self.pc_ip_edit.setText(wired or str(pc.get("ip", "")))
-        self.pc_user_edit.setText(str(pc.get("user", "wujie") or "wujie"))
-        self.pc_password_edit.setText(str(pc.get("password", "123456") or "123456"))
 
-        # 域控：IP 留空需手动填；默认 nvidia/nvidia
-        self.host_edit.setText(str(dc.get("host", "")))
+        # 域控 IP：从配置/历史恢复，启动后不主动清空
+        self._load_host_history()
         self.port_spin.setValue(int(dc.get("port", 22)))
         self.user_edit.setText(str(dc.get("user", "nvidia") or "nvidia"))
         self.password_edit.setText(str(dc.get("password", "nvidia") or "nvidia"))
-        self.key_edit.setText(str(dc.get("key_filename", "")))
-        self.container_edit.setText(str(dc.get("container_name", "")))
-        self.work_edit.setText(str(dc.get("host_work_dir", "/home/nvidia/work/anyverse")))
         self.domain_spin.setValue(int(ros.get("domain_id", 40)))
         self.iface_edit.setText(str(ros.get("network_interface", "eth5")))
 
@@ -340,20 +395,26 @@ class MainWindow(QMainWindow):
         self.config.setdefault("domain_controller", {})
         self.config.setdefault("pc", {})
         self.config.setdefault("ros", {})
-        self.config["domain_controller"].update(
+        dc = self.config["domain_controller"]
+        host = self._host_text()
+        # 仅在非空时更新 host，避免空值覆盖历史
+        if host:
+            dc["host"] = host
+        dc.update(
             {
-                "host": self.host_edit.text().strip(),
                 "port": self.port_spin.value(),
                 "user": self.user_edit.text().strip() or "nvidia",
                 "password": self.password_edit.text() or "nvidia",
-                "key_filename": self.key_edit.text().strip(),
-                "container_name": self.container_edit.text().strip(),
-                "host_work_dir": self.work_edit.text().strip(),
             }
         )
+        # 私钥 / 容器名 / 仓库路径：界面已隐藏，保留配置文件中的值
+        dc.setdefault("key_filename", "")
+        dc.setdefault("container_name", "")
+        dc.setdefault("host_work_dir", "/home/nvidia/work/anyverse")
+        dc.setdefault("host_history", [])
         self.config["pc"]["ip"] = self.pc_ip_edit.text().strip()
-        self.config["pc"]["user"] = self.pc_user_edit.text().strip() or "wujie"
-        self.config["pc"]["password"] = self.pc_password_edit.text() or "123456"
+        self.config["pc"].setdefault("user", "wujie")
+        self.config["pc"].setdefault("password", "123456")
         self.config["ros"]["domain_id"] = self.domain_spin.value()
         self.config["ros"]["network_interface"] = self.iface_edit.text().strip()
 
@@ -408,7 +469,7 @@ class MainWindow(QMainWindow):
 
     def _set_connection_status(self, ok: bool) -> None:
         if ok:
-            self.conn_label.setText(f"已连接 {self.host_edit.text().strip()}")
+            self.conn_label.setText(f"已连接 {self._host_text()}")
             self.conn_label.setObjectName("statusConnected")
         else:
             self.conn_label.setText("未连接")
@@ -427,9 +488,12 @@ class MainWindow(QMainWindow):
         if not self.ssh or not self.ssh.connected:
             raise RuntimeError("请先连接域控")
         self._apply_fields_to_config()
-        # 同步 UI 字段到 ssh 对象
-        self.ssh.container_name = self.container_edit.text().strip()
-        self.ssh.host_work_dir = self.work_edit.text().strip()
+        # 同步配置到 ssh 对象（容器名 / 仓库路径来自配置文件）
+        dc = self.config.get("domain_controller", {})
+        self.ssh.container_name = str(dc.get("container_name", "") or "")
+        self.ssh.host_work_dir = str(
+            dc.get("host_work_dir", "/home/nvidia/work/anyverse") or "/home/nvidia/work/anyverse"
+        )
         return AppContext(config=self.config, ssh=self.ssh, log=self.append_log)
 
     @Slot()
@@ -499,12 +563,26 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "传输失败", res.combined or "未知错误")
 
     @Slot()
+    def on_host_editing_finished(self) -> None:
+        """离开输入框时记住本次填写（空值不覆盖历史）。"""
+        host = self._remember_host(persist=True)
+        if host:
+            self.append_log(f"已记住域控 IP: {host}")
+
+    @Slot()
     def on_connect(self) -> None:
-        host = self.host_edit.text().strip()
+        host = self._host_text()
+        if not host:
+            # 尝试用配置里上次的 host
+            last = str(self.config.get("domain_controller", {}).get("host", "") or "").strip()
+            if last:
+                self._set_host_text(last)
+                host = last
         if not host:
             QMessageBox.warning(self, "域控 IP", "请手动填写目标域控 IP")
             self.host_edit.setFocus()
             return
+        self._remember_host(persist=True)
         self._apply_fields_to_config()
         dc = self.config["domain_controller"]
         try:
@@ -519,16 +597,17 @@ class MainWindow(QMainWindow):
                 host_work_dir=dc.get("host_work_dir", "/home/nvidia/work/anyverse"),
             )
             client.connect(log=self.append_log)
-            # 探测容器
+            # 探测容器并写回配置（界面已不展示容器名）
             try:
                 name = client.resolve_container(log=self.append_log)
-                self.container_edit.setText(name)
+                self.config.setdefault("domain_controller", {})["container_name"] = name
             except Exception as exc:  # noqa: BLE001
                 self.append_log(f"提示: 暂未解析到容器 ({exc})，可先跑「Docker 拉取」步骤")
             if self.ssh:
                 self.ssh.close()
             self.ssh = client
             self._set_connection_status(True)
+            save_config(self.config)
         except Exception as exc:  # noqa: BLE001
             self._set_connection_status(False)
             QMessageBox.critical(self, "连接失败", str(exc))
@@ -543,6 +622,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def on_save_config(self) -> None:
+        self._remember_host(persist=False)
         self._apply_fields_to_config()
         save_config(self.config)
         self.append_log(f"配置已保存: {ROOT / 'config' / 'default.yaml'}")
@@ -649,7 +729,7 @@ class MainWindow(QMainWindow):
             results,
             out_dir,
             meta={
-                "host": self.host_edit.text().strip(),
+                "host": self._host_text(),
                 "domain_id": self.domain_spin.value(),
             },
         )

@@ -2,8 +2,10 @@
 # 本机仅展示日志；所有命令通过 SSH + docker exec 在域控执行。
 
 domain_controller:
-  # 目标域控 IP 需手动填写
+  # 最近一次填写的域控 IP（填写后自动记住，不会主动清空）
   host: ""
+  # 历史填写记录（下拉可选）
+  host_history: []
   port: 22
   user: "nvidia"
   password: "nvidia"
