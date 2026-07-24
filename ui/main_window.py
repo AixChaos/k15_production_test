@@ -95,13 +95,6 @@ class MainWindow(QMainWindow):
         header.addWidget(self.conn_label)
         layout.addLayout(header)
 
-        hint = QLabel(
-            "页面1：连接配置与文件传输 · 页面2：环境配置与生产测试 · 本机仅显示日志，命令经 SSH + docker exec 执行"
-        )
-        hint.setObjectName("hint")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
         # 顶层两个页面
         self.main_tabs = QTabWidget()
         self.main_tabs.setObjectName("mainTabs")
@@ -162,9 +155,6 @@ class MainWindow(QMainWindow):
         self.user_edit = QLineEdit("nvidia")
         self.password_edit = QLineEdit("nvidia")
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.domain_spin = QSpinBox()
-        self.domain_spin.setRange(0, 101)
-        self.iface_edit = QLineEdit()
 
         form.addRow(QLabel("<b>目标域控</b>"))
         host_row = QHBoxLayout()
@@ -174,11 +164,6 @@ class MainWindow(QMainWindow):
         form.addRow("域控 IP", host_row)
         form.addRow("用户名", self.user_edit)
         form.addRow("密码", self.password_edit)
-        row_ros = QHBoxLayout()
-        row_ros.addWidget(self.domain_spin)
-        row_ros.addWidget(QLabel("DDS 网卡"))
-        row_ros.addWidget(self.iface_edit)
-        form.addRow("DOMAIN_ID", row_ros)
 
         btn_row = QHBoxLayout()
         self.btn_connect = QPushButton("连接域控")
@@ -377,7 +362,6 @@ class MainWindow(QMainWindow):
     def _load_fields_from_config(self) -> None:
         dc = self.config.get("domain_controller", {})
         pc = self.config.get("pc", {})
-        ros = self.config.get("ros", {})
 
         # 本机：自动探测网线 IP（不影响域控 IP）
         wired = get_wired_ipv4()
@@ -388,8 +372,6 @@ class MainWindow(QMainWindow):
         self.port_spin.setValue(int(dc.get("port", 22)))
         self.user_edit.setText(str(dc.get("user", "nvidia") or "nvidia"))
         self.password_edit.setText(str(dc.get("password", "nvidia") or "nvidia"))
-        self.domain_spin.setValue(int(ros.get("domain_id", 40)))
-        self.iface_edit.setText(str(ros.get("network_interface", "eth5")))
 
     def _apply_fields_to_config(self) -> None:
         self.config.setdefault("domain_controller", {})
@@ -415,8 +397,9 @@ class MainWindow(QMainWindow):
         self.config["pc"]["ip"] = self.pc_ip_edit.text().strip()
         self.config["pc"].setdefault("user", "wujie")
         self.config["pc"].setdefault("password", "123456")
-        self.config["ros"]["domain_id"] = self.domain_spin.value()
-        self.config["ros"]["network_interface"] = self.iface_edit.text().strip()
+        # DOMAIN_ID / DDS 网卡：界面已隐藏，保留配置文件默认值
+        self.config["ros"].setdefault("domain_id", 40)
+        self.config["ros"].setdefault("network_interface", "eth5")
 
     def _current_list(self) -> QListWidget:
         return self.env_list if self.step_tabs.currentIndex() == 0 else self.test_list
@@ -730,7 +713,7 @@ class MainWindow(QMainWindow):
             out_dir,
             meta={
                 "host": self._host_text(),
-                "domain_id": self.domain_spin.value(),
+                "domain_id": self.config.get("ros", {}).get("domain_id", 40),
             },
         )
         self.append_log(f"报告已导出: {path}")
