@@ -31,9 +31,10 @@ python main.py
 1. 启动后自动填充本机网线 IP，本机账号默认 `wujie` / `123456`
 2. **手动填写域控 IP**，域控账号默认 `nvidia` / `nvidia`，点击「连接域控」
 3. 文件传输：先「1. 选择本地文件」，再「2. 选择域控路径并传输」（无写权限时自动 sudo）
-4. 「环境配置」/「生产测试」页：选中步骤 →「执行本步骤」→ 右侧看日志
-5. 需人工核对的步骤执行后点「人工确认通过」
-6. 「导出报告」生成 `reports/k15_test_report_*.json`
+4. 「环境配置」页步骤「上传部署环境压缩包」：执行时选择本机 `K15_env_con.tar.gz`（含密钥、anyverse-dev-pnc、docker_arm 镜像、99-EtherCAT.rules），自动上传并部署，右侧日志显示 1/7…7/7 进度
+5. 其他「环境配置」/「生产测试」步骤：选中 →「执行本步骤」→ 右侧看日志
+6. 需人工核对的步骤执行后点「人工确认通过」
+7. 「导出报告」生成 `reports/k15_test_report_*.json`
 
 ## 配置
 
@@ -45,6 +46,6 @@ python main.py
 
 ## 说明
 
-- `docker_run.sh` 若为交互菜单，步骤会提示在域控终端手动执行
+- 环境压缩包部署使用 `docker load` 导入 `docker_arm_*.tar.gz` 镜像
 - Talker/Listener 在**域控容器内自环**验证；完整 PC↔域控需在装有 ROS2 的 PC 上另测 listener
 - 本机不安装 / 不启动 ROS2

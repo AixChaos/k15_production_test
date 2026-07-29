@@ -3,60 +3,92 @@ from __future__ import annotations
 
 import textwrap
 
+from core.config import ROOT
 from core.context import AppContext
 from steps.base import LogFn, StepResult, TestStep, shell_ok
 
 
-class ChassisBuildStep(TestStep):
+class ChassisTopicTestStep(TestStep):
+    """编译底盘包后，在容器内运行 sensor_topic_test.py。"""
+
+    LOCAL_SCRIPT = ROOT / "script" / "sensor_topic_test.py"
+    REMOTE_SCRIPT = "/tmp/k15_sensor_topic_test.py"
+
     def __init__(self) -> None:
         super().__init__(
-            id="test_chassis_build",
-            title="编译底盘话题代码",
-            description="./script/build.sh -s src/robot_hardwares/monkey_chassis_v2",
-            category="test",
-        )
-
-    def run(self, ctx: AppContext, log: LogFn) -> StepResult:
-        return shell_ok(
-            ctx,
-            "./script/build.sh -s src/robot_hardwares/monkey_chassis_v2",
-            log,
-            docker=True,
-            timeout=3600,
-        )
-
-
-class SensorTopicTestStep(TestStep):
-    def __init__(self) -> None:
-        super().__init__(
-            id="test_sensor_topic",
+            id="test_chassis_topic",
             title="底盘话题测试",
-            description="python sensor_topic_test.py --hz --bw --yes",
+            description=(
+                "1) 编译 monkey_chassis_v2  2) source .ws/devel/setup.bash  "
+                "3) 执行 script/sensor_topic_test.py（日志实时输出）"
+            ),
             category="test",
         )
 
     def run(self, ctx: AppContext, log: LogFn) -> StepResult:
-        cmd = (
+        if not self.LOCAL_SCRIPT.is_file():
+            return StepResult(False, f"本机缺少测试脚本: {self.LOCAL_SCRIPT}", "")
+
+        logs: list[str] = []
+
+        # —— 1 编译 ——
+        log("—— 1/2 编译底盘话题代码 ——")
+        build = ctx.ssh.exec_docker(
+            "./script/build.sh -s src/robot_hardwares/monkey_chassis_v2",
+            log=log,
+            timeout=3600,
+            stream_output=True,
+        )
+        logs.append(build.combined)
+        if not build.ok:
+            return StepResult(False, f"底盘编译失败 (exit={build.exit_code})", "\n".join(logs))
+        log("编译完成")
+
+        # —— 2 上传并执行测试脚本 ——
+        log("—— 2/2 执行底盘话题测试脚本 ——")
+        try:
+            content = self.LOCAL_SCRIPT.read_text(encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            return StepResult(False, f"读取本机脚本失败: {exc}", "\n".join(logs))
+
+        up = ctx.ssh.write_remote_file(
+            self.REMOTE_SCRIPT, content, sudo=False, log=None
+        )
+        if not up.ok:
+            return StepResult(False, "上传测试脚本到域控失败", up.combined)
+
+        name = ctx.ssh.resolve_container(log=None)
+        cp = ctx.ssh.exec_host(
+            f"docker cp {self.REMOTE_SCRIPT} {name}:{self.REMOTE_SCRIPT}",
+            log=None,
+            timeout=60,
+            stream_output=False,
+        )
+        if not cp.ok:
+            return StepResult(False, "拷贝测试脚本到容器失败", cp.combined)
+
+        # source 工作空间后执行；--yes 避免交互卡住
+        run_cmd = (
             f"{ctx.source_ws()} && "
             f"{ctx.ros_env_exports()} && "
-            "python sensor_topic_test.py --hz --bw --yes "
-            "|| python3 sensor_topic_test.py --hz --bw --yes "
-            "|| python ./sensor_topic_test.py --hz --bw --yes "
-            "|| python3 ./script/sensor_topic_test.py --hz --bw --yes "
-            "|| find . -name sensor_topic_test.py 2>/dev/null | head -3"
+            f"python3 {self.REMOTE_SCRIPT} --hz --bw --yes"
         )
-        res = ctx.ssh.exec_docker(cmd, log=log, timeout=600)
-        lower = res.combined.lower()
-        ok = res.ok and ("fail" not in lower or "passed" in lower or "pass" in lower)
-        # 若只是找到了文件路径，说明脚本位置需人工确认
-        if "sensor_topic_test.py" in res.combined and not res.ok:
+        log("开始运行 sensor_topic_test.py …")
+        res = ctx.ssh.exec_docker(
+            run_cmd,
+            log=log,
+            timeout=1800,
+            stream_output=True,
+        )
+        logs.append(res.combined)
+        if not res.ok:
             return StepResult(
                 False,
-                "未成功运行测试脚本，请确认脚本路径后重试",
-                res.combined,
-                needs_manual_confirm=True,
+                f"底盘话题测试失败 (exit={res.exit_code})",
+                "\n".join(logs),
             )
-        return StepResult(ok or res.ok, "话题测试完成" if res.ok else "话题测试失败", res.combined)
+        log("底盘话题测试脚本执行完成")
+        return StepResult(True, "底盘话题测试完成", "\n".join(logs))
 
 
 class DdsConfigStep(TestStep):
@@ -297,8 +329,7 @@ class JointLatencyStep(TestStep):
 
 
 TEST_STEPS = [
-    ChassisBuildStep(),
-    SensorTopicTestStep(),
+    ChassisTopicTestStep(),
     DdsConfigStep(),
     RosDaemonStep(),
     DomainIdStep(),

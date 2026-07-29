@@ -10,6 +10,9 @@ from typing import Any, Callable
 from core.ssh_client import SshClient
 
 LogFn = Callable[[str], None]
+UploadBeginFn = Callable[[str, int], None]
+UploadProgressFn = Callable[[int, int, int, str], None]
+UploadEndFn = Callable[[bool], None]
 
 
 @dataclass
@@ -18,6 +21,14 @@ class AppContext:
     ssh: SshClient
     log: LogFn = field(default=lambda _m: None)
     cancelled: bool = False
+    # 本机选择的环境压缩包路径（由 UI 在执行步骤前填入）
+    local_package_path: str = ""
+    # 上传进度（由 UI 注入，供弹窗显示）
+    on_upload_begin: UploadBeginFn | None = None
+    on_upload_progress: UploadProgressFn | None = None
+    on_upload_end: UploadEndFn | None = None
+    # 双臂末端：installed=已装 / not_installed=未装
+    end_effector_mode: str = ""
 
     @property
     def dc(self) -> dict[str, Any]:

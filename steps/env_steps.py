@@ -3,21 +3,24 @@ from __future__ import annotations
 
 import json
 import textwrap
+from pathlib import Path
 
 from core.context import AppContext
 from steps.base import LogFn, StepResult, TestStep, shell_ok
 
 
 class DockerSetupStep(TestStep):
-    """原文档：加入 docker 组 → 写 daemon.json → 重启 docker，合并为一步。"""
+    """加入 docker 组 → 刷新会话组权限 → 写 daemon.json → 重启 docker。"""
 
     def __init__(self) -> None:
         super().__init__(
             id="env_docker_setup",
             title="配置 Docker（用户组 / 镜像源 / 重启）",
             description=(
-                "1) usermod -aG docker  2) 写入 daemon.json（registry-mirrors / nvidia）"
+                "1) usermod -aG docker + 重连 SSH（等效 newgrp，使当前会话立即生效）"
+                "  2) 写入 daemon.json（registry-mirrors / nvidia）"
                 "  3) systemctl daemon-reload && restart docker"
+                "  4) 无 sudo 验证 docker ps"
             ),
             category="env",
             dangerous=True,
@@ -25,19 +28,46 @@ class DockerSetupStep(TestStep):
 
     def run(self, ctx: AppContext, log: LogFn) -> StepResult:
         logs: list[str] = []
-        user = ctx.dc.get("user", "anyverse")
+        user = ctx.dc.get("user", "nvidia") or "nvidia"
 
-        log("—— 1/3 加入 docker 用户组 ——")
+        log("—— 1/4 加入 docker 用户组 ——")
+        # usermod 只改帐号配置；当前 SSH 会话的补充组在连接时已固定，不会自动更新。
+        # 交互终端里的 newgrp docker 会开新 shell；非交互 SSH 里 newgrp 无法刷新后续 exec，
+        # 因此这里用「重连 SSH」达到与 newgrp / 重新登录相同的效果。
         res1 = ctx.ssh.exec_host(
-            f"sudo usermod -aG docker {user} && groups {user}",
+            f"{ctx.ssh._sudo_cmd(f'usermod -aG docker {user}')} && getent group docker && id {user}",
             log=log,
             timeout=60,
+            stream_output=False,
         )
         logs.append(res1.combined)
         if not res1.ok:
             return StepResult(False, f"加入 docker 组失败 (exit={res1.exit_code})", "\n".join(logs))
+        # getent group docker → docker:x:979:nvidia
+        getent_lines = [ln for ln in res1.combined.splitlines() if ln.startswith("docker:")]
+        if not getent_lines or user not in getent_lines[-1].split(":")[-1].split(","):
+            # 兼容 members 字段含空格等情况：只要行里同时有 docker 与用户名
+            if not any(ln.startswith("docker:") and user in ln for ln in res1.combined.splitlines()):
+                return StepResult(False, f"usermod 后未在 docker 组中看到 {user}", "\n".join(logs))
+        log(f"已将用户 {user} 加入 docker 组")
 
-        log("—— 2/3 配置 Docker 仓库镜像 ——")
+        log("—— 2/4 重连 SSH，使 docker 组立即生效 ——")
+        try:
+            ctx.ssh.connect(log=log)
+        except Exception as exc:  # noqa: BLE001
+            return StepResult(False, f"重连 SSH 失败: {exc}", "\n".join(logs))
+        # 校验「当前会话」组（id/groups），不要用 groups <user>（那只看帐号配置）
+        res_id = ctx.ssh.exec_host("id; groups", log=log, timeout=30, stream_output=False)
+        logs.append(res_id.combined)
+        if "docker" not in res_id.combined:
+            return StepResult(
+                False,
+                "重连后当前会话仍无 docker 组，请检查 /etc/group 与 SSH 登录组刷新",
+                "\n".join(logs),
+            )
+        log("当前会话已包含 docker 组")
+
+        log("—— 3/4 配置 Docker 仓库镜像 ——")
         d = ctx.config.get("docker", {})
         payload = {
             "registry-mirrors": d.get("registry_mirrors", []),
@@ -51,82 +81,288 @@ class DockerSetupStep(TestStep):
         }
         content = json.dumps(payload, indent=4, ensure_ascii=False) + "\n"
         path = d.get("daemon_json_path", "/etc/docker/daemon.json")
-        res2 = ctx.ssh.write_remote_file(path, content, sudo=True, log=log)
+        res2 = ctx.ssh.write_remote_file(path, content, sudo=True, log=None)
         logs.append(res2.combined)
         if not res2.ok:
             return StepResult(False, f"写入 daemon.json 失败: {res2.combined}", "\n".join(logs))
+        log("daemon.json 已更新")
 
-        log("—— 3/3 重启 Docker ——")
+        log("—— 4/4 重启 Docker 并验证免 sudo ——")
         res3 = ctx.ssh.exec_host(
-            "sudo systemctl daemon-reload && sudo systemctl restart docker && sudo systemctl is-active docker",
+            f"{ctx.ssh._sudo_cmd('systemctl daemon-reload')} && "
+            f"{ctx.ssh._sudo_cmd('systemctl restart docker')} && "
+            f"{ctx.ssh._sudo_cmd('systemctl is-active docker')}",
             log=log,
             timeout=120,
+            stream_output=False,
         )
         logs.append(res3.combined)
         if not res3.ok:
             return StepResult(False, f"重启 Docker 失败 (exit={res3.exit_code})", "\n".join(logs))
+        log("Docker 服务已重启")
+
+        # 重启 docker 后 sock 重建，确认 nvidia 免 sudo 可用
+        res4 = ctx.ssh.exec_host(
+            "docker ps >/dev/null && echo 'DOCKER_OK_WITHOUT_SUDO'",
+            log=log,
+            timeout=60,
+            stream_output=False,
+        )
+        logs.append(res4.combined)
+        if not res4.ok or "DOCKER_OK_WITHOUT_SUDO" not in res4.combined:
+            return StepResult(
+                False,
+                "docker 组已配置但当前会话仍无法免 sudo 使用 docker，请断开后重新「连接域控」再试",
+                "\n".join(logs),
+            )
+        log("已验证：无需 sudo 即可使用 docker")
 
         return StepResult(
             True,
-            "Docker 用户组、镜像源已配置并已重启（用户组需重新登录/newgrp 后完全生效）",
+            "Docker 用户组已生效（免 sudo）、镜像源已配置并已重启",
             "\n".join(logs),
         )
 
 
-class GitlabSshStep(TestStep):
+class EnvPackageDeployStep(TestStep):
+    """选择本机环境压缩包，上传到域控并完成密钥/代码/镜像/udev 部署。"""
+
+    TOTAL_STEPS = 7
+
     def __init__(self) -> None:
         super().__init__(
-            id="env_gitlab_ssh",
-            title="验证 GitLab SSH 密钥",
-            description="ssh -T git@gitlab.anyverse.work，期望 Welcome to GitLab",
+            id="env_package_deploy",
+            title="上传部署环境压缩包",
+            description=(
+                "手动选择本机 K15_env_con.tar.gz（含：密钥、anyverse-dev-pnc.tar.gz、"
+                "docker_arm_*.tar.gz、99-EtherCAT.rules）→ 上传域控 → 解压 → "
+                "安装 SSH 密钥到 ~/.ssh、代码到 ~/work、docker load 镜像、"
+                "安装 udev 规则并 reload/trigger"
+            ),
             category="env",
+            dangerous=True,
         )
+
+    def _stage(self, log: LogFn, index: int, title: str) -> None:
+        log(f"—— {index}/{self.TOTAL_STEPS} {title} ——")
 
     def run(self, ctx: AppContext, log: LogFn) -> StepResult:
-        # GitLab 成功时 exit code 往往非 0，靠欢迎语判断
-        res = ctx.ssh.exec_host(
-            "ssh -o StrictHostKeyChecking=accept-new -T git@gitlab.anyverse.work 2>&1 || true",
-            log=log,
-            timeout=60,
-        )
-        text = res.combined
-        ok = "Welcome to GitLab" in text or "authenticated" in text.lower()
-        return StepResult(
-            ok=ok,
-            message="密钥有效" if ok else "未检测到 Welcome 提示，请检查密钥",
-            log=text,
-        )
+        logs: list[str] = []
+        local_path = (ctx.local_package_path or "").strip()
+        if not local_path:
+            cfg = ctx.config.get("env_package") or {}
+            local_path = str(cfg.get("local_path") or "").strip()
+        local = Path(local_path)
+        if not local.is_file():
+            return StepResult(False, "未选择有效的本机压缩包，请先在文件对话框中选择", "")
 
+        user = ctx.dc.get("user", "nvidia") or "nvidia"
+        home = f"/home/{user}"
+        work_dir = f"{home}/work"
+        staging_root = f"{home}/k15_env_staging"
+        remote_archive = f"{staging_root}/{local.name}"
+        extract_dir = f"{staging_root}/extract"
 
-class CloneCodeStep(TestStep):
-    def __init__(self) -> None:
-        super().__init__(
-            id="env_clone",
-            title="首次拉取代码",
-            description="git clone -b branch --recurse-submodules（已存在则跳过）",
-            category="env",
-        )
+        # —— 1 上传 ——
+        self._stage(log, 1, "上传环境压缩包到域控")
+        size_gb = local.stat().st_size / (1024**3)
+        log(f"文件: {local.name}（约 {size_gb:.1f} GB），上传中请耐心等待")
+        try:
+            up = ctx.ssh.upload_local_file(
+                str(local),
+                remote_archive,
+                log=log,
+                progress=ctx.on_upload_progress,
+                on_begin=ctx.on_upload_begin,
+                on_end=ctx.on_upload_end,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return StepResult(False, f"上传失败: {exc}", str(exc))
+        logs.append(up.combined)
+        if not up.ok:
+            return StepResult(False, f"上传失败 (exit={up.exit_code})", "\n".join(logs))
 
-    def run(self, ctx: AppContext, log: LogFn) -> StepResult:
-        git = ctx.config.get("git", {})
-        parent = git.get("host_clone_parent", "/home/anyverse/work")
-        repo = git.get("repo", "git@gitlab.anyverse.work:dev/anyverse.git")
-        branch = git.get("branch", "dev/pnc")
-        work = ctx.dc.get("host_work_dir", f"{parent}/anyverse")
-        cmd = textwrap.dedent(
+        # —— 2 解压外层包 ——
+        self._stage(log, 2, "在域控解压环境压缩包")
+        log("正在解压（大文件可能需要数分钟）…")
+        extract_cmd = textwrap.dedent(
             f"""
             set -e
-            if [ -d "{work}/.git" ]; then
-              echo "代码已存在: {work}"
-              cd "{work}" && git rev-parse --abbrev-ref HEAD && git status -sb | head -5
-            else
-              mkdir -p "{parent}"
-              cd "{parent}"
-              git clone -b "{branch}" --recurse-submodules "{repo}"
-            fi
+            rm -rf "{extract_dir}"
+            mkdir -p "{extract_dir}"
+            tar -xzf "{remote_archive}" -C "{extract_dir}"
+            echo OK
             """
         ).strip()
-        return shell_ok(ctx, cmd, log, timeout=3600)
+        res_ex = ctx.ssh.exec_host(extract_cmd, log=log, timeout=7200, stream_output=False)
+        logs.append(res_ex.combined)
+        if not res_ex.ok:
+            return StepResult(False, f"解压失败 (exit={res_ex.exit_code})", "\n".join(logs))
+        log("解压完成")
+
+        # —— 3 安装 SSH 密钥 ——
+        self._stage(log, 3, "安装 SSH 密钥")
+        key_cmd = textwrap.dedent(
+            f"""
+            set -e
+            KEY_DIR=$(find "{extract_dir}" -maxdepth 2 -type d \\( -name '密钥' -o -iname 'ssh*' -o -iname '*key*' \\) | head -1)
+            if [ -z "$KEY_DIR" ]; then
+              if ls "{extract_dir}"/id_* >/dev/null 2>&1; then
+                KEY_DIR="{extract_dir}"
+              else
+                echo "ERROR: 未找到密钥目录"
+                exit 1
+              fi
+            fi
+            mkdir -p "{home}/.ssh"
+            cp -a "$KEY_DIR"/. "{home}/.ssh/"
+            chmod 700 "{home}/.ssh"
+            find "{home}/.ssh" -type f -name 'id_*' ! -name '*.pub' -exec chmod 600 {{}} +
+            find "{home}/.ssh" -type f -name '*.pub' -exec chmod 644 {{}} +
+            chown -R "{user}:{user}" "{home}/.ssh" 2>/dev/null || true
+            echo OK
+            """
+        ).strip()
+        res_key = ctx.ssh.exec_host(key_cmd, log=log, timeout=120, stream_output=False)
+        logs.append(res_key.combined)
+        if not res_key.ok:
+            err = res_key.combined.strip() or f"exit={res_key.exit_code}"
+            return StepResult(False, f"安装密钥失败: {err}", "\n".join(logs))
+        log("密钥已安装到 ~/.ssh")
+
+        # —— 4 解压代码包 ——
+        self._stage(log, 4, "解压代码包到 work 目录")
+        log("正在解压 anyverse-dev-pnc…")
+        code_cmd = textwrap.dedent(
+            f"""
+            set -e
+            CODE_TGZ=$(find "{extract_dir}" -maxdepth 2 -type f -name 'anyverse-dev-pnc*.tar.gz' | head -1)
+            if [ -z "$CODE_TGZ" ]; then
+              CODE_TGZ=$(find "{extract_dir}" -maxdepth 2 -type f -name 'anyverse*.tar.gz' ! -name 'docker*' | head -1)
+            fi
+            if [ -z "$CODE_TGZ" ]; then
+              echo "ERROR: 未找到 anyverse-dev-pnc.tar.gz"
+              exit 1
+            fi
+            mkdir -p "{work_dir}"
+            tar -xzf "$CODE_TGZ" -C "{work_dir}"
+            echo OK
+            """
+        ).strip()
+        res_code = ctx.ssh.exec_host(code_cmd, log=log, timeout=7200, stream_output=False)
+        logs.append(res_code.combined)
+        if not res_code.ok:
+            err = res_code.combined.strip() or f"exit={res_code.exit_code}"
+            return StepResult(False, f"解压代码包失败: {err}", "\n".join(logs))
+        log("代码包解压完成")
+
+        # —— 5 加载 Docker 镜像 ——
+        self._stage(log, 5, "加载 Docker 镜像")
+        log("正在 docker load（大镜像耗时较长）…")
+        if ctx.ssh.password:
+            esc = ctx.ssh.password.replace("'", "'\"'\"'")
+            sudo_fn = (
+                f"sudo_run() {{ printf '%s\\n' '{esc}' | sudo -S -p '' \"$@\"; }}"
+            )
+        else:
+            sudo_fn = 'sudo_run() { sudo -n "$@"; }'
+        docker_cmd = textwrap.dedent(
+            f"""
+            set -e
+            {sudo_fn}
+            IMG=$(find "{extract_dir}" -maxdepth 2 -type f \\( -name 'docker_arm*.tar.gz' -o -name 'docker_arm*.tar' -o -name 'docker*.tar.gz' \\) | head -1)
+            if [ -z "$IMG" ]; then
+              IMG_DIR=$(find "{extract_dir}" -maxdepth 2 -type d -name 'docker_arm*' | head -1)
+              if [ -n "$IMG_DIR" ]; then
+                IMG=$(find "$IMG_DIR" -maxdepth 2 -type f \\( -name '*.tar.gz' -o -name '*.tar' \\) | head -1)
+              fi
+            fi
+            if [ -z "$IMG" ]; then
+              echo "ERROR: 未找到 docker_arm 镜像压缩包"
+              exit 1
+            fi
+            do_load() {{
+              local img="$1"
+              if docker load -i "$img" >/tmp/k15_docker_load.out 2>/tmp/k15_docker_load.err; then
+                return 0
+              fi
+              if [[ "$img" == *.tar.gz ]] || [[ "$img" == *.tgz ]]; then
+                if sudo_run docker load -i "$img" >/tmp/k15_docker_load.out 2>/tmp/k15_docker_load.err; then
+                  return 0
+                fi
+                gunzip -c "$img" | sudo_run docker load >/tmp/k15_docker_load.out 2>/tmp/k15_docker_load.err
+              else
+                sudo_run docker load -i "$img" >/tmp/k15_docker_load.out 2>/tmp/k15_docker_load.err
+              fi
+            }}
+            if [[ "$IMG" == *.tar.gz ]] || [[ "$IMG" == *.tgz ]]; then
+              if ! do_load "$IMG"; then
+                gunzip -c "$IMG" | docker load >/tmp/k15_docker_load.out 2>/tmp/k15_docker_load.err \\
+                  || gunzip -c "$IMG" | sudo_run docker load >/tmp/k15_docker_load.out 2>/tmp/k15_docker_load.err
+              fi
+            else
+              do_load "$IMG"
+            fi
+            echo OK
+            """
+        ).strip()
+        res_docker = ctx.ssh.exec_host(docker_cmd, log=log, timeout=14400, stream_output=False)
+        logs.append(res_docker.combined)
+        if not res_docker.ok:
+            return StepResult(
+                False,
+                f"Docker 镜像部署失败 (exit={res_docker.exit_code})",
+                "\n".join(logs),
+            )
+        log("Docker 镜像加载完成")
+
+        # —— 6 安装 udev 规则 ——
+        self._stage(log, 6, "安装 EtherCAT udev 规则")
+        sudo_install = ctx.ssh._sudo_cmd(
+            "sh -c 'cp \"$1\" /etc/udev/rules.d/99-EtherCAT.rules && chmod 644 /etc/udev/rules.d/99-EtherCAT.rules' _ \"$RULE\""
+        )
+        udev_install = textwrap.dedent(
+            f"""
+            set -e
+            RULE=$(find "{extract_dir}" -maxdepth 2 -type f -name '99-EtherCAT.rules' | head -1)
+            if [ -z "$RULE" ]; then
+              RULE=$(find "{extract_dir}" -maxdepth 2 -type f -name '*EtherCAT*.rules' | head -1)
+            fi
+            if [ -z "$RULE" ]; then
+              echo "ERROR: 未找到 99-EtherCAT.rules"
+              exit 1
+            fi
+            {sudo_install}
+            echo OK
+            """
+        ).strip()
+        res_udev = ctx.ssh.exec_host(udev_install, log=log, timeout=120, stream_output=False)
+        logs.append(res_udev.combined)
+        if not res_udev.ok:
+            err = res_udev.combined.strip() or f"exit={res_udev.exit_code}"
+            return StepResult(False, f"安装 udev 规则失败: {err}", "\n".join(logs))
+        log("udev 规则已安装")
+
+        # —— 7 生效 udev ——
+        self._stage(log, 7, "生效 udev 规则")
+        reload_cmd = (
+            ctx.ssh._sudo_cmd("udevadm control --reload-rules")
+            + " && "
+            + ctx.ssh._sudo_cmd("udevadm trigger")
+            + " && echo OK"
+        )
+        res_reload = ctx.ssh.exec_host(reload_cmd, log=log, timeout=120, stream_output=False)
+        logs.append(res_reload.combined)
+        if not res_reload.ok:
+            return StepResult(False, f"udev 生效失败 (exit={res_reload.exit_code})", "\n".join(logs))
+        log("udev 规则已生效")
+
+        log("全部子步骤完成")
+        return StepResult(
+            True,
+            "环境压缩包已部署：密钥 / 代码 / Docker 镜像 / EtherCAT udev 规则",
+            "\n".join(logs),
+        )
 
 
 class CameraInitStep(TestStep):
@@ -143,58 +379,6 @@ class CameraInitStep(TestStep):
         work = ctx.dc.get("host_work_dir", "/home/anyverse/work/anyverse")
         cmd = f"cd {work} && sudo ./script/anyverse_config_init.sh"
         return shell_ok(ctx, cmd, log, timeout=600)
-
-
-class DockerRunStep(TestStep):
-    def __init__(self) -> None:
-        super().__init__(
-            id="env_docker_run",
-            title="Docker 拉取 / 启动容器",
-            description="checkout 分支后执行 docker/docker_run.sh（非交互：优先已有容器）",
-            category="env",
-        )
-
-    def run(self, ctx: AppContext, log: LogFn) -> StepResult:
-        work = ctx.dc.get("host_work_dir", "/home/anyverse/work/anyverse")
-        branch = ctx.config.get("git", {}).get("branch", "dev/pnc")
-        # 交互脚本难以自动化：若已有运行容器则直接通过；否则尝试常见非交互参数
-        check = ctx.ssh.exec_host(
-            "docker ps --format '{{.Names}}' | head -5",
-            log=log,
-            timeout=30,
-        )
-        running = [x.strip().strip("'") for x in check.stdout.splitlines() if x.strip()]
-        if running:
-            ctx.ssh.container_name = ctx.ssh.container_name or running[0]
-            log(f"已有运行中容器: {', '.join(running)}")
-            return StepResult(True, f"容器已运行 ({running[0]})", check.combined)
-
-        cmd = textwrap.dedent(
-            f"""
-            set -e
-            cd "{work}"
-            git checkout "{branch}" || true
-            # 尝试非交互；若脚本仅支持菜单，请人工在域控执行 bash docker/docker_run.sh 选 2
-            if grep -qE 'non-interactive|NONINTERACTIVE|--yes|-y' docker/docker_run.sh 2>/dev/null; then
-              NONINTERACTIVE=1 bash docker/docker_run.sh || bash docker/docker_run.sh --yes || true
-            else
-              echo "WARN: docker_run.sh 可能为交互式菜单。请在域控终端手动执行:"
-              echo "  cd {work} && bash docker/docker_run.sh"
-              echo "选择 2 重建容器后，在本上位机点「连接」再继续。"
-              exit 2
-            fi
-            docker ps --format '{{{{.Names}}}}\\t{{{{.Status}}}}'
-            """
-        ).strip()
-        res = ctx.ssh.exec_host(cmd, log=log, timeout=3600)
-        if res.exit_code == 2:
-            return StepResult(
-                False,
-                "需人工在域控执行 docker_run.sh（交互菜单）",
-                res.combined,
-                needs_manual_confirm=True,
-            )
-        return StepResult(res.ok, "成功" if res.ok else "失败", res.combined)
 
 
 class CameraSnStep(TestStep):
@@ -258,7 +442,10 @@ class HardwareBuildStep(TestStep):
         super().__init__(
             id="env_hw_build",
             title="本体硬件包编译",
-            description="hardware_integration / marvin_dual_arm / monkey_chassis / moveit 包",
+            description=(
+                "编译 hardware_integration / marvin_dual_arm / monkey_chassis / moveit；"
+                "完成后设置 EtherCAT 的 C_INCLUDE_PATH / CPLUS_INCLUDE_PATH / LIBRARY_PATH / LD_LIBRARY_PATH"
+            ),
             category="env",
         )
 
@@ -276,76 +463,203 @@ class HardwareBuildStep(TestStep):
             logs.append(res.combined)
             if not res.ok:
                 return StepResult(False, f"编译失败: {p}", "\n".join(logs))
-        # EtherCAT 环境变量提示
-        log("提示: EtherCAT 相关编译可 export C_INCLUDE_PATH / LD_LIBRARY_PATH（见文档）")
-        return StepResult(True, "硬件相关包编译完成", "\n".join(logs))
+
+        log("设置 EtherCAT 环境变量…")
+        ethercat_env = textwrap.dedent(
+            r"""
+            set -e
+            export C_INCLUDE_PATH=/anyverse/sub_modules/sal/ethercat/include:$C_INCLUDE_PATH
+            export CPLUS_INCLUDE_PATH=/anyverse/sub_modules/sal/ethercat/include:$CPLUS_INCLUDE_PATH
+            export LIBRARY_PATH=/anyverse/sub_modules/sal/ethercat/lib/.libs:$LIBRARY_PATH
+            export LD_LIBRARY_PATH=/anyverse/sub_modules/sal/ethercat/lib/.libs:$LD_LIBRARY_PATH
+            ENV_FILE=/anyverse/.k15_ethercat_env.sh
+            printf '%s\n' \
+              'export C_INCLUDE_PATH=/anyverse/sub_modules/sal/ethercat/include:$C_INCLUDE_PATH' \
+              'export CPLUS_INCLUDE_PATH=/anyverse/sub_modules/sal/ethercat/include:$CPLUS_INCLUDE_PATH' \
+              'export LIBRARY_PATH=/anyverse/sub_modules/sal/ethercat/lib/.libs:$LIBRARY_PATH' \
+              'export LD_LIBRARY_PATH=/anyverse/sub_modules/sal/ethercat/lib/.libs:$LD_LIBRARY_PATH' \
+              > "$ENV_FILE"
+            if [ -f "$HOME/.bashrc" ] && ! grep -q 'k15_ethercat_env' "$HOME/.bashrc" 2>/dev/null; then
+              echo 'source /anyverse/.k15_ethercat_env.sh 2>/dev/null || true' >> "$HOME/.bashrc"
+            fi
+            echo "C_INCLUDE_PATH=$C_INCLUDE_PATH"
+            echo "CPLUS_INCLUDE_PATH=$CPLUS_INCLUDE_PATH"
+            echo "LIBRARY_PATH=$LIBRARY_PATH"
+            echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+            echo "ETHERCAT_ENV_OK"
+            """
+        ).strip()
+        res_env = ctx.ssh.exec_docker(ethercat_env, log=log, timeout=60)
+        logs.append(res_env.combined)
+        if not res_env.ok or "ETHERCAT_ENV_OK" not in res_env.combined:
+            return StepResult(
+                False,
+                f"硬件包已编译，但 EtherCAT 环境变量设置失败 (exit={res_env.exit_code})",
+                "\n".join(logs),
+            )
+        log("EtherCAT 环境变量已设置（并写入 /anyverse/.k15_ethercat_env.sh）")
+        return StepResult(True, "硬件相关包编译完成，EtherCAT 环境变量已设置", "\n".join(logs))
 
 
-class MockGripperStep(TestStep):
+class EndEffectorConfigStep(TestStep):
+    """双臂末端配置：按是否安装末端设备，切换 gripper plugin。"""
+
+    REAL_PLUGIN = "zx_90d_gripper/Zx90dGripperHardware"
+    MOCK_PLUGIN = "mock_components/GenericSystem"
+    CONTAINER_PATH = (
+        "/anyverse/src/pnc/config/moveit_config/"
+        "kitt_1_5_robot_with_zx90d_moveit/config/"
+        "kitt_1_5_robot_with_zx90d_hw_params.yaml"
+    )
+
     def __init__(self) -> None:
         super().__init__(
-            id="env_mock_gripper",
-            title="末端未装：夹爪改为 Mock",
-            description="hw_params.yaml 中 left/right gripper plugin → mock_components/GenericSystem",
+            id="env_end_effector",
+            title="双臂末端配置",
+            description=(
+                "选择已装/未装末端设备后，检查并更新 hw_params.yaml 中 "
+                "left_gripper / right_gripper 的 plugin"
+            ),
             category="env",
-            needs_manual=True,
         )
 
     def run(self, ctx: AppContext, log: LogFn) -> StepResult:
-        rel = ctx.config.get("moveit", {}).get(
-            "hw_params_relpath",
-            "src/pnc/config/moveit_config/kitt_1_5_robot_with_zx90d_moveit/config/kitt_1_5_robot_with_zx90d_hw_params.yaml",
-        )
-        work = ctx.dc.get("host_work_dir", "/home/anyverse/work/anyverse")
-        path = f"{work}/{rel}"
-        # 在宿主机改文件（通常挂载进容器）
+        mode = (ctx.end_effector_mode or "").strip()
+        if mode not in ("installed", "not_installed"):
+            return StepResult(False, "未选择末端配置方式（已装 / 未装）", "")
+
+        target = self.REAL_PLUGIN if mode == "installed" else self.MOCK_PLUGIN
+        mode_cn = "已装末端设备" if mode == "installed" else "未装末端设备"
+        log(f"模式: {mode_cn}")
+        log(f"目标 plugin: {target}")
+
+        # 注意：外层不要用 f-string，保留脚本内 {var} 给容器内 Python 使用
         py = textwrap.dedent(
             r"""
             import pathlib, re, sys
-            p = pathlib.Path(sys.argv[1])
-            if not p.exists():
-                print(f"MISSING:{p}")
-                sys.exit(1)
-            text = p.read_text(encoding="utf-8")
-            def repl_block(name, text):
-                # 将对应 gripper 块内 plugin 改为 mock
-                pattern = rf"({name}:\n(?:.*\n)*?\s*)plugin:\s*.*"
-                new, n = re.subn(
-                    pattern,
-                    rf"\1plugin: mock_components/GenericSystem",
-                    text,
-                    count=1,
-                )
-                return new if n else text
-            text2 = repl_block("left_gripper", text)
-            text2 = repl_block("right_gripper", text2)
-            p.write_text(text2, encoding="utf-8")
+            path = pathlib.Path(sys.argv[1])
+            target = sys.argv[2]
+            if not path.exists():
+                print("MISSING")
+                sys.exit(2)
+
+            raw = path.read_text(encoding="utf-8")
+            lines = raw.splitlines(keepends=True)
+            blocks = {"left_gripper", "right_gripper"}
+            current = None
+            current_plugins = {"left_gripper": None, "right_gripper": None}
+            plugin_idx = {"left_gripper": None, "right_gripper": None}
+
+            for i, line in enumerate(lines):
+                m_key = re.match(r"^([A-Za-z0-9_]+):\s*$", line)
+                if m_key:
+                    name = m_key.group(1)
+                    current = name if name in blocks else None
+                    continue
+                if current is None:
+                    continue
+                m_plug = re.match(r"^([ \t]*)plugin:\s*(.+?)\s*$", line)
+                if m_plug:
+                    current_plugins[current] = m_plug.group(2).strip()
+                    plugin_idx[current] = i
+
+            left = current_plugins["left_gripper"]
+            right = current_plugins["right_gripper"]
+            if left is None or right is None:
+                print("ERROR_NO_PLUGIN")
+                sys.exit(3)
+            if left == target and right == target:
+                print("ALREADY_OK")
+                sys.exit(0)
+
+            for name in ("left_gripper", "right_gripper"):
+                idx = plugin_idx[name]
+                line = lines[idx]
+                indent = re.match(r"^([ \t]*)", line).group(1)
+                nl = "\n" if line.endswith("\n") else ""
+                lines[idx] = f"{indent}plugin: {target}{nl}"
+
+            new_text = "".join(lines)
+            try:
+                path.write_text(new_text, encoding="utf-8")
+            except PermissionError:
+                import tempfile, os, subprocess
+                with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tf:
+                    tf.write(new_text)
+                    tmp = tf.name
+                subprocess.check_call(["sudo", "cp", tmp, str(path)])
+                os.unlink(tmp)
+
+            text2 = path.read_text(encoding="utf-8")
+
+            def read_plugin(src, block):
+                cur = None
+                for ln in src.splitlines():
+                    if re.match(rf"^{block}:\s*$", ln):
+                        cur = block
+                        continue
+                    if cur and re.match(r"^[A-Za-z0-9_]+:\s*$", ln):
+                        cur = None
+                        continue
+                    if cur:
+                        m = re.match(r"^[ \t]*plugin:\s*(.+?)\s*$", ln)
+                        if m:
+                            return m.group(1).strip()
+                return None
+
+            nl = read_plugin(text2, "left_gripper")
+            nr = read_plugin(text2, "right_gripper")
+            if nl != target or nr != target:
+                print("ERROR_VERIFY")
+                sys.exit(4)
             print("UPDATED")
-            print(p.read_text(encoding="utf-8")[-800:])
             """
         ).strip()
-        # 上传临时脚本执行
-        res_w = ctx.ssh.write_remote_file("/tmp/k15_mock_gripper.py", py + "\n", sudo=False, log=log)
-        if not res_w.ok:
-            return StepResult(False, "上传脚本失败", res_w.combined)
-        res = ctx.ssh.exec_host(f"python3 /tmp/k15_mock_gripper.py '{path}'", log=log, timeout=60)
-        ok = res.ok and "UPDATED" in res.combined
-        return StepResult(
-            ok=ok,
-            message="已改为 Mock，请确认 YAML 后点「人工确认通过」" if ok else "修改失败或文件不存在",
-            log=res.combined,
-            needs_manual_confirm=True,
+
+        res_w = ctx.ssh.write_remote_file(
+            "/tmp/k15_end_effector.py", py + "\n", sudo=False, log=None
         )
+        if not res_w.ok:
+            return StepResult(False, "上传配置脚本失败", res_w.combined)
+
+        name = ctx.ssh.resolve_container(log=None)
+        prep = ctx.ssh.exec_host(
+            f"docker cp /tmp/k15_end_effector.py {name}:/tmp/k15_end_effector.py",
+            log=None,
+            timeout=30,
+            stream_output=False,
+        )
+        if not prep.ok:
+            return StepResult(False, "拷贝脚本到容器失败", prep.combined)
+
+        res = ctx.ssh.exec_docker(
+            f"python3 /tmp/k15_end_effector.py '{self.CONTAINER_PATH}' '{target}'",
+            log=None,
+            timeout=60,
+            stream_output=False,
+        )
+        text = res.combined
+        if "MISSING" in text:
+            return StepResult(False, "配置文件不存在", text)
+        if "ERROR_NO_PLUGIN" in text:
+            return StepResult(False, "未找到左右夹爪 plugin 配置", text)
+        if "ALREADY_OK" in text:
+            log("配置已是目标状态，无需修改")
+            return StepResult(True, f"{mode_cn}：配置已正确，无需修改", text)
+        if "UPDATED" in text:
+            log("配置已更新并保存")
+            return StepResult(True, f"{mode_cn}：已更新左右夹爪 plugin 为 {target}", text)
+        if "ERROR_VERIFY" in text:
+            return StepResult(False, f"{mode_cn}：写入后复核失败", text)
+        return StepResult(False, f"{mode_cn}：修改失败", text)
 
 
 ENV_STEPS = [
     DockerSetupStep(),
-    GitlabSshStep(),
-    CloneCodeStep(),
+    EnvPackageDeployStep(),
     CameraInitStep(),
-    DockerRunStep(),
     CameraSnStep(),
     CameraBuildStep(),
     HardwareBuildStep(),
-    MockGripperStep(),
+    EndEffectorConfigStep(),
 ]

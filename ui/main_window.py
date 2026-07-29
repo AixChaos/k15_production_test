@@ -34,11 +34,17 @@ from core.ssh_client import SshClient
 from steps import all_steps, steps_by_category
 from steps.base import StepResult, StepStatus, TestStep
 from ui.remote_path_dialog import RemotePathDialog
+from ui.end_effector_dialog import EndEffectorChoiceDialog
 from ui.styles import APP_QSS, STATUS_COLORS
+from ui.upload_progress_dialog import UploadProgressDialog
 
 
 class StepWorker(QThread):
     log_line = Signal(str)
+    # 字节数可能超过 2GB，不能用 Qt int（有符号 32 位），改用 object 传 Python int
+    upload_begin = Signal(str, object)  # filename, total_bytes
+    upload_progress = Signal(int, object, object, str)  # pct, done, total, speed
+    upload_end = Signal(bool)
     finished_step = Signal(str, object)  # step_id, StepResult
 
     def __init__(self, step: TestStep, ctx: AppContext) -> None:
@@ -49,6 +55,15 @@ class StepWorker(QThread):
     def run(self) -> None:
         def _log(msg: str) -> None:
             self.log_line.emit(msg)
+
+        self.ctx.log = _log
+        self.ctx.on_upload_begin = lambda name, total: self.upload_begin.emit(name, int(total))
+        self.ctx.on_upload_progress = (
+            lambda pct, done, total, speed: self.upload_progress.emit(
+                int(pct), int(done), int(total), speed or ""
+            )
+        )
+        self.ctx.on_upload_end = lambda ok: self.upload_end.emit(bool(ok))
 
         try:
             result = self.step.run(self.ctx, _log)
@@ -71,6 +86,7 @@ class MainWindow(QMainWindow):
         self.worker: Optional[StepWorker] = None
         self._busy = False
         self._local_file: str = ""
+        self._upload_dlg: Optional[UploadProgressDialog] = None
 
         self._build_ui()
         self._load_fields_from_config()
@@ -266,13 +282,6 @@ class MainWindow(QMainWindow):
         right = QWidget()
         right_l = QVBoxLayout(right)
         right_l.setContentsMargins(0, 0, 0, 0)
-        self.detail_title = QLabel("选择步骤")
-        self.detail_title.setObjectName("title")
-        self.detail_desc = QLabel("")
-        self.detail_desc.setObjectName("hint")
-        self.detail_desc.setWordWrap(True)
-        right_l.addWidget(self.detail_title)
-        right_l.addWidget(self.detail_desc)
         right_l.addWidget(QLabel("实时日志"))
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
@@ -481,18 +490,8 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def on_selection_changed(self, *_args) -> None:
-        step = self._current_step()
-        if not step:
-            return
-        self.detail_title.setText(step.title)
-        extra = []
-        if step.dangerous:
-            extra.append("危险操作：请确认域控环境后再执行。")
-        if step.needs_manual:
-            extra.append("需要人工确认：执行后请检查结果，再点「人工确认通过」。")
-        if step.last_message:
-            extra.append(f"上次结果: {step.last_message}")
-        self.detail_desc.setText(step.description + ("\n" + "\n".join(extra) if extra else ""))
+        # 右侧仅保留实时日志，不再展示步骤说明
+        return
 
     @Slot()
     def on_refresh_pc_ip(self) -> None:
@@ -513,6 +512,23 @@ class MainWindow(QMainWindow):
         self.local_file_edit.setText(path)
         self.append_log(f"已选择本地文件: {path}")
 
+    @Slot(str, object)
+    def on_upload_begin(self, filename: str, total: object) -> None:
+        if self._upload_dlg is None:
+            self._upload_dlg = UploadProgressDialog(self)
+        self._upload_dlg.start(filename, int(total or 0))
+
+    @Slot(int, object, object, str)
+    def on_upload_progress(self, pct: int, done: object, total: object, speed: str) -> None:
+        if self._upload_dlg is not None:
+            self._upload_dlg.update_progress(int(pct), int(done or 0), int(total or 0), speed or "")
+
+    @Slot(bool)
+    def on_upload_end(self, ok: bool) -> None:
+        if self._upload_dlg is not None:
+            self._upload_dlg.finish(ok)
+            self._upload_dlg = None
+
     @Slot()
     def on_transfer_file(self) -> None:
         if not self._local_file or not Path(self._local_file).is_file():
@@ -532,9 +548,34 @@ class MainWindow(QMainWindow):
         remote = dlg.selected_path()
         self.remote_path_edit.setText(remote)
         self.append_log(f"\n======== 文件传输 ========\n本地: {self._local_file}\n域控: {remote}")
+
+        progress_dlg = UploadProgressDialog(self)
+        from PySide6.QtWidgets import QApplication
+
+        def _begin(name: str, total: int) -> None:
+            progress_dlg.start(name, total)
+            QApplication.processEvents()
+
+        def _prog(pct: int, done: int, total: int, speed: str) -> None:
+            progress_dlg.update_progress(pct, done, total, speed)
+            QApplication.processEvents()
+
+        def _end(ok: bool) -> None:
+            progress_dlg.finish(ok)
+            QApplication.processEvents()
+
         try:
-            res = self.ssh.upload_local_file(self._local_file, remote, log=self.append_log)
+            res = self.ssh.upload_local_file(
+                self._local_file,
+                remote,
+                log=self.append_log,
+                progress=_prog,
+                on_begin=_begin,
+                on_end=_end,
+            )
         except Exception as exc:  # noqa: BLE001
+            if progress_dlg.isVisible():
+                progress_dlg.finish(False)
             QMessageBox.critical(self, "传输失败", str(exc))
             self.append_log(f"[FAIL] 传输异常: {exc}")
             return
@@ -585,7 +626,7 @@ class MainWindow(QMainWindow):
                 name = client.resolve_container(log=self.append_log)
                 self.config.setdefault("domain_controller", {})["container_name"] = name
             except Exception as exc:  # noqa: BLE001
-                self.append_log(f"提示: 暂未解析到容器 ({exc})，可先跑「Docker 拉取」步骤")
+                self.append_log(f"提示: 暂未解析到容器 ({exc})，可先完成环境压缩包部署后再连接")
             if self.ssh:
                 self.ssh.close()
             self.ssh = client
@@ -611,6 +652,20 @@ class MainWindow(QMainWindow):
         self.append_log(f"配置已保存: {ROOT / 'config' / 'default.yaml'}")
         QMessageBox.information(self, "保存", "配置已写入 config/default.yaml")
 
+    def _pick_env_package(self) -> str:
+        """选择本机环境压缩包；默认打开 ~/下载。"""
+        downloads = Path.home() / "下载"
+        if not downloads.is_dir():
+            downloads = Path.home() / "Downloads"
+        start = str(downloads if downloads.is_dir() else Path.home())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择环境压缩包 (如 K15_env_con.tar.gz)",
+            start,
+            "压缩包 (*.tar.gz *.tgz);;所有文件 (*)",
+        )
+        return path or ""
+
     @Slot()
     def on_run_step(self) -> None:
         if self._busy:
@@ -628,11 +683,42 @@ class MainWindow(QMainWindow):
             )
             if ret != QMessageBox.StandardButton.Yes:
                 return
+
+        package_path = ""
+        if step.id == "env_package_deploy":
+            package_path = self._pick_env_package()
+            if not package_path:
+                self.append_log("已取消：未选择环境压缩包")
+                return
+            if not Path(package_path).is_file():
+                QMessageBox.warning(self, "文件无效", f"所选文件不存在:\n{package_path}")
+                return
+            self.append_log(f"已选择环境压缩包: {package_path}")
+
+        end_effector_mode = ""
+        if step.id == "env_end_effector":
+            choice_dlg = EndEffectorChoiceDialog(self)
+            if choice_dlg.exec() != choice_dlg.DialogCode.Accepted:
+                self.append_log("已取消：未选择末端配置方式")
+                return
+            end_effector_mode = choice_dlg.selected_mode() or ""
+            if not end_effector_mode:
+                self.append_log("已取消：未选择末端配置方式")
+                return
+            mode_cn = "已装末端设备" if end_effector_mode == "installed" else "未装末端设备"
+            self.append_log(f"已选择: {mode_cn}")
+
         try:
             ctx = self.make_ctx()
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "未连接", str(exc))
             return
+
+        if package_path:
+            ctx.local_package_path = package_path
+            ctx.config.setdefault("env_package", {})["local_path"] = package_path
+        if end_effector_mode:
+            ctx.end_effector_mode = end_effector_mode
 
         self._busy = True
         step.status = StepStatus.RUNNING
@@ -642,6 +728,9 @@ class MainWindow(QMainWindow):
 
         self.worker = StepWorker(step, ctx)
         self.worker.log_line.connect(self.append_log)
+        self.worker.upload_begin.connect(self.on_upload_begin)
+        self.worker.upload_progress.connect(self.on_upload_progress)
+        self.worker.upload_end.connect(self.on_upload_end)
         self.worker.finished_step.connect(self.on_step_finished)
         self.worker.start()
 
