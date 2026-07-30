@@ -42,7 +42,10 @@ class SshClient:
     container_name: str = ""
     container_work_dir: str = "/anyverse"
     host_work_dir: str = "/home/anyverse/work/anyverse"
+    # 与 docker/docker_into.sh 的 EXEC_USER 一致；勿用默认 root，否则 .ws 会被建成 root 属主
+    container_user: str = "admin"
     _client: Optional[paramiko.SSHClient] = field(default=None, repr=False)
+    _ws_ownership_fixed: bool = field(default=False, repr=False)
 
     def connect(self, log: LogFn | None = None) -> None:
         def _log(msg: str) -> None:
@@ -78,6 +81,7 @@ class SshClient:
             except Exception:
                 pass
             self._client = None
+        self._ws_ownership_fixed = False
 
     @property
     def connected(self) -> bool:
@@ -177,6 +181,41 @@ class SshClient:
         self.container_name = names[0]
         return names[0]
 
+    def _ensure_workspace_writable(self, name: str, log: LogFn | None = None) -> None:
+        """纠正历史 root 编译属主，并预写 GitLab known_hosts（避免编译卡在 yes/no）。
+
+        上位机旧逻辑 docker exec 默认 root，会把 /anyverse/.ws 建成 root:root；
+        docker_into.sh 以 admin 进入后编译会 Permission denied。此处用 root 一次性 chown。
+        """
+        if self._ws_ownership_fixed:
+            return
+        user = (self.container_user or "admin").strip() or "admin"
+        git_host = "gitlab.anyverse.work"
+        fix = (
+            f'docker exec -u root {name} bash -lc '
+            f'"'
+            f'chown -R {user}:{user} /anyverse/.ws 2>/dev/null || true; '
+            f'chown {user}:{user} /anyverse/.k15_ethercat_env.sh 2>/dev/null || true; '
+            f'_kh() {{ '
+            f'  local h=\"$1\"; local own=\"$2\"; '
+            f'  mkdir -p \"$h\"; touch \"$h/known_hosts\"; chmod 700 \"$h\"; chmod 644 \"$h/known_hosts\"; '
+            f'  if ! grep -qF {git_host} \"$h/known_hosts\" 2>/dev/null; then '
+            f'    ssh-keyscan -H {git_host} >> \"$h/known_hosts\" 2>/dev/null || true; '
+            f'  fi; '
+            f'  if [ -n \"$own\" ]; then chown -R \"$own:$own\" \"$h\" 2>/dev/null || true; fi; '
+            f'}}; '
+            f'_kh /home/{user}/.ssh {user}; '
+            f'_kh /root/.ssh \"\"'
+            f'"'
+        )
+        try:
+            self.exec_host(fix, log=None, timeout=120, stream_output=False)
+            if log:
+                log(f"已确保容器工作区属主为 {user}，并写入 {git_host} known_hosts")
+        except Exception:  # noqa: BLE001
+            pass
+        self._ws_ownership_fixed = True
+
     def exec_docker(
         self,
         command: str,
@@ -187,15 +226,17 @@ class SshClient:
         stream_output: bool = True,
     ) -> ExecResult:
         name = self.resolve_container(log=log)
+        self._ensure_workspace_writable(name, log=log)
         wd = workdir or self.container_work_dir
         env_prefix = ""
         if env:
             parts = [f'{k}="{v}"' for k, v in env.items()]
             env_prefix = " ".join(parts) + " "
-        # 用 bash -lc 以便 source
+        # 用 bash -lc 以便 source；-u 与 docker_into.sh 的 EXEC_USER 对齐
         inner = f"cd {wd} && {env_prefix}{command}"
         quoted = inner.replace("'", "'\"'\"'")
-        host_cmd = f"docker exec {name} bash -lc '{quoted}'"
+        user = (self.container_user or "admin").strip() or "admin"
+        host_cmd = f"docker exec -u {user} {name} bash -lc '{quoted}'"
         return self.exec_host(
             host_cmd, log=log, timeout=timeout, stream_output=stream_output
         )

@@ -486,6 +486,7 @@ class MainWindow(QMainWindow):
         self.ssh.host_work_dir = str(
             dc.get("host_work_dir", "/home/nvidia/work/anyverse") or "/home/nvidia/work/anyverse"
         )
+        self.ssh.container_user = str(dc.get("container_user", "admin") or "admin")
         return AppContext(config=self.config, ssh=self.ssh, log=self.append_log)
 
     @Slot()
@@ -619,6 +620,7 @@ class MainWindow(QMainWindow):
                 container_name=dc.get("container_name", "") or "",
                 container_work_dir=dc.get("container_work_dir", "/anyverse"),
                 host_work_dir=dc.get("host_work_dir", "/home/nvidia/work/anyverse"),
+                container_user=dc.get("container_user", "admin") or "admin",
             )
             client.connect(log=self.append_log)
             # 探测容器并写回配置（界面已不展示容器名）

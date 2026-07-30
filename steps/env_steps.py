@@ -10,17 +10,17 @@ from steps.base import LogFn, StepResult, TestStep, shell_ok
 
 
 class DockerSetupStep(TestStep):
-    """加入 docker 组 → 刷新会话组权限 → 写 daemon.json → 重启 docker。"""
+    """加入 docker 组 → 刷新会话组权限 → 写 daemon.json → 重启 docker → 授权 sock。"""
 
     def __init__(self) -> None:
         super().__init__(
             id="env_docker_setup",
             title="配置 Docker（用户组 / 镜像源 / 重启）",
             description=(
-                "1) usermod -aG docker + 重连 SSH（等效 newgrp，使当前会话立即生效）"
+                "1) usermod -aG docker + 重连 SSH"
                 "  2) 写入 daemon.json（registry-mirrors / nvidia）"
-                "  3) systemctl daemon-reload && restart docker"
-                "  4) 无 sudo 验证 docker ps"
+                "  3) systemctl restart docker"
+                "  4) 给当前用户 ACL 授权 docker.sock（已有终端无需 newgrp 即可用 docker）"
             ),
             category="env",
             dangerous=True,
@@ -30,7 +30,7 @@ class DockerSetupStep(TestStep):
         logs: list[str] = []
         user = ctx.dc.get("user", "nvidia") or "nvidia"
 
-        log("—— 1/4 加入 docker 用户组 ——")
+        log("—— 1/5 加入 docker 用户组 ——")
         # usermod 只改帐号配置；当前 SSH 会话的补充组在连接时已固定，不会自动更新。
         # 交互终端里的 newgrp docker 会开新 shell；非交互 SSH 里 newgrp 无法刷新后续 exec，
         # 因此这里用「重连 SSH」达到与 newgrp / 重新登录相同的效果。
@@ -51,7 +51,7 @@ class DockerSetupStep(TestStep):
                 return StepResult(False, f"usermod 后未在 docker 组中看到 {user}", "\n".join(logs))
         log(f"已将用户 {user} 加入 docker 组")
 
-        log("—— 2/4 重连 SSH，使 docker 组立即生效 ——")
+        log("—— 2/5 重连 SSH，使上位机会话立即带上 docker 组 ——")
         try:
             ctx.ssh.connect(log=log)
         except Exception as exc:  # noqa: BLE001
@@ -65,9 +65,9 @@ class DockerSetupStep(TestStep):
                 "重连后当前会话仍无 docker 组，请检查 /etc/group 与 SSH 登录组刷新",
                 "\n".join(logs),
             )
-        log("当前会话已包含 docker 组")
+        log("上位机 SSH 会话已包含 docker 组")
 
-        log("—— 3/4 配置 Docker 仓库镜像 ——")
+        log("—— 3/5 配置 Docker 仓库镜像 ——")
         d = ctx.config.get("docker", {})
         payload = {
             "registry-mirrors": d.get("registry_mirrors", []),
@@ -87,7 +87,34 @@ class DockerSetupStep(TestStep):
             return StepResult(False, f"写入 daemon.json 失败: {res2.combined}", "\n".join(logs))
         log("daemon.json 已更新")
 
-        log("—— 4/4 重启 Docker 并验证免 sudo ——")
+        log("—— 4/5 写入 docker.sock ACL 持久化（重启 Docker 后仍生效）——")
+        # 远程已打开的终端不会自动获得新 group；仅靠 usermod+newgrp 对「当前已登录 shell」无效。
+        # 给该用户 ACL 写 docker.sock，无需 newgrp / 重新登录即可 docker_run.sh。
+        dropin_dir = "/etc/systemd/system/docker.service.d"
+        dropin_path = f"{dropin_dir}/k15-sock-acl.conf"
+        dropin_body = textwrap.dedent(
+            f"""\
+            [Service]
+            # K15 上位机：Docker 重启后为 {user} 恢复 sock 访问（无需 newgrp）
+            ExecStartPost=-/bin/sh -c '/usr/bin/setfacl -m u:{user}:rw /var/run/docker.sock 2>/dev/null || chmod 666 /var/run/docker.sock'
+            """
+        )
+        res_drop = ctx.ssh.write_remote_file(dropin_path, dropin_body, sudo=True, log=None)
+        if not res_drop.ok:
+            # 目录可能不存在，先创建再写
+            ctx.ssh.exec_host(
+                ctx.ssh._sudo_cmd(f"mkdir -p {dropin_dir}"),
+                log=None,
+                timeout=30,
+                stream_output=False,
+            )
+            res_drop = ctx.ssh.write_remote_file(dropin_path, dropin_body, sudo=True, log=None)
+        logs.append(res_drop.combined)
+        if not res_drop.ok:
+            return StepResult(False, f"写入 docker ACL drop-in 失败: {res_drop.combined}", "\n".join(logs))
+        log("已配置 docker.service ExecStartPost ACL")
+
+        log("—— 5/5 重启 Docker、授权 sock 并验证 ——")
         res3 = ctx.ssh.exec_host(
             f"{ctx.ssh._sudo_cmd('systemctl daemon-reload')} && "
             f"{ctx.ssh._sudo_cmd('systemctl restart docker')} && "
@@ -101,7 +128,23 @@ class DockerSetupStep(TestStep):
             return StepResult(False, f"重启 Docker 失败 (exit={res3.exit_code})", "\n".join(logs))
         log("Docker 服务已重启")
 
-        # 重启 docker 后 sock 重建，确认 nvidia 免 sudo 可用
+        # 立即再授一次权（防止 ExecStartPost 时机早于 sock 创建）
+        acl_cmd = (
+            ctx.ssh._sudo_cmd(
+                f"sh -c 'if command -v setfacl >/dev/null; then "
+                f"setfacl -m u:{user}:rw /var/run/docker.sock; "
+                f"else chmod 666 /var/run/docker.sock; fi; "
+                f"ls -l /var/run/docker.sock; getfacl -p /var/run/docker.sock 2>/dev/null | head -20 || true'"
+            )
+        )
+        res_acl = ctx.ssh.exec_host(acl_cmd, log=log, timeout=30, stream_output=False)
+        logs.append(res_acl.combined)
+        if not res_acl.ok:
+            return StepResult(False, f"授权 docker.sock 失败: {res_acl.combined}", "\n".join(logs))
+        log(f"已为用户 {user} 授权 /var/run/docker.sock")
+
+        # 模拟「尚未 newgrp 的旧会话」：用 sg 去掉 docker 组后仍应能访问（依赖 ACL）
+        # 同时验证当前会话 docker ps
         res4 = ctx.ssh.exec_host(
             "docker ps >/dev/null && echo 'DOCKER_OK_WITHOUT_SUDO'",
             log=log,
@@ -112,14 +155,14 @@ class DockerSetupStep(TestStep):
         if not res4.ok or "DOCKER_OK_WITHOUT_SUDO" not in res4.combined:
             return StepResult(
                 False,
-                "docker 组已配置但当前会话仍无法免 sudo 使用 docker，请断开后重新「连接域控」再试",
+                "docker 仍无法免 sudo 使用，请检查 /var/run/docker.sock 权限与 ACL",
                 "\n".join(logs),
             )
-        log("已验证：无需 sudo 即可使用 docker")
+        log("已验证：无需 sudo 即可使用 docker（远程已有终端也无需再 newgrp）")
 
         return StepResult(
             True,
-            "Docker 用户组已生效（免 sudo）、镜像源已配置并已重启",
+            "Docker 已配置：用户组 + 镜像源 + sock ACL（远程终端可直接 docker_run.sh）",
             "\n".join(logs),
         )
 
@@ -136,7 +179,7 @@ class EnvPackageDeployStep(TestStep):
             description=(
                 "手动选择本机 K15_env_con.tar.gz（含：密钥、anyverse-dev-pnc.tar.gz、"
                 "docker_arm_*.tar.gz、99-EtherCAT.rules）→ 上传域控 → 解压 → "
-                "安装 SSH 密钥到 ~/.ssh、代码到 ~/work、docker load 镜像、"
+                "安装 SSH 密钥与 GitLab known_hosts、代码到 ~/work、docker load 镜像、"
                 "安装 udev 规则并 reload/trigger"
             ),
             category="env",
@@ -202,6 +245,16 @@ class EnvPackageDeployStep(TestStep):
 
         # —— 3 安装 SSH 密钥 ——
         self._stage(log, 3, "安装 SSH 密钥")
+        git_repo = str((ctx.config.get("git") or {}).get("repo") or "")
+        git_host = "gitlab.anyverse.work"
+        if git_repo.startswith("git@"):
+            # git@host:group/repo.git
+            git_host = git_repo.split("@", 1)[1].split(":", 1)[0] or git_host
+        elif "://" in git_repo:
+            # ssh://git@host/… 或 https://host/…
+            rest = git_repo.split("://", 1)[1]
+            rest = rest.split("@")[-1]
+            git_host = rest.split("/")[0].split(":")[0] or git_host
         key_cmd = textwrap.dedent(
             f"""
             set -e
@@ -219,6 +272,17 @@ class EnvPackageDeployStep(TestStep):
             chmod 700 "{home}/.ssh"
             find "{home}/.ssh" -type f -name 'id_*' ! -name '*.pub' -exec chmod 600 {{}} +
             find "{home}/.ssh" -type f -name '*.pub' -exec chmod 644 {{}} +
+            # 预写入 GitLab host key，避免编译时并行 git fetch 卡在 yes/no 提示
+            touch "{home}/.ssh/known_hosts"
+            chmod 644 "{home}/.ssh/known_hosts"
+            if ! grep -qF "{git_host}" "{home}/.ssh/known_hosts" 2>/dev/null; then
+              ssh-keyscan -H "{git_host}" >> "{home}/.ssh/known_hosts" 2>/dev/null || true
+            fi
+            if ! grep -qF "{git_host}" "{home}/.ssh/known_hosts" 2>/dev/null; then
+              echo "WARN: ssh-keyscan {git_host} 未写入 known_hosts（网络或 DNS 可能不可达）"
+            else
+              echo "KNOWN_HOSTS_OK {git_host}"
+            fi
             chown -R "{user}:{user}" "{home}/.ssh" 2>/dev/null || true
             echo OK
             """
@@ -228,7 +292,10 @@ class EnvPackageDeployStep(TestStep):
         if not res_key.ok:
             err = res_key.combined.strip() or f"exit={res_key.exit_code}"
             return StepResult(False, f"安装密钥失败: {err}", "\n".join(logs))
-        log("密钥已安装到 ~/.ssh")
+        if "KNOWN_HOSTS_OK" in res_key.combined:
+            log(f"SSH 密钥已安装，known_hosts 已加入 {git_host}")
+        else:
+            log(f"SSH 密钥已安装；警告: 未能写入 {git_host} 到 known_hosts，编译时可能出现 SSH 确认提示")
 
         # —— 4 解压代码包 ——
         self._stage(log, 4, "解压代码包到 work 目录")
@@ -370,15 +437,95 @@ class CameraInitStep(TestStep):
         super().__init__(
             id="env_camera_init",
             title="相机初始化配置",
-            description="宿主机执行 anyverse_config_init.sh（仅一次，必须成功）",
+            description=(
+                "若 agent_dev_nvidia 在运行则先 docker stop → "
+                "anyverse_config_init.sh → docker_run.sh 选 2 重建并启动容器"
+            ),
             category="env",
             dangerous=True,
         )
 
     def run(self, ctx: AppContext, log: LogFn) -> StepResult:
-        work = ctx.dc.get("host_work_dir", "/home/anyverse/work/anyverse")
-        cmd = f"cd {work} && sudo ./script/anyverse_config_init.sh"
-        return shell_ok(ctx, cmd, log, timeout=600)
+        work = ctx.dc.get("host_work_dir", "/home/nvidia/work/anyverse")
+        cname = "agent_dev_nvidia"
+        logs: list[str] = []
+
+        log(f"检查容器是否在运行: {cname}")
+        check = ctx.ssh.exec_host(
+            f'docker ps --format "{{{{.Names}}}}" | grep -Fx "{cname}" '
+            f'&& echo RUNNING || echo NOT_RUNNING',
+            log=log,
+            timeout=60,
+            stream_output=False,
+        )
+        logs.append(check.combined)
+
+        if "RUNNING" in check.combined:
+            log(f"容器 {cname} 正在运行，先停止…")
+            stop = ctx.ssh.exec_host(
+                f'docker stop "{cname}"',
+                log=log,
+                timeout=180,
+                stream_output=True,
+            )
+            logs.append(stop.combined)
+            if not stop.ok:
+                return StepResult(
+                    False,
+                    f"停止容器 {cname} 失败 (exit={stop.exit_code})",
+                    "\n".join(logs),
+                )
+            log(f"容器 {cname} 已停止")
+        else:
+            log(f"容器 {cname} 未在运行，直接执行初始化脚本")
+
+        log("执行 anyverse_config_init.sh …")
+        cmd = f'cd "{work}" && sudo ./script/anyverse_config_init.sh'
+        res = ctx.ssh.exec_host(cmd, log=log, timeout=600, stream_output=True)
+        logs.append(res.combined)
+        if not res.ok:
+            return StepResult(
+                False,
+                f"相机初始化失败 (exit={res.exit_code})",
+                "\n".join(logs),
+            )
+
+        # docker_run.sh 为交互菜单：选 2 = 重建容器并启动
+        log("执行 docker_run.sh（菜单选项 2：重建并启动容器）…")
+        run_cmd = f'cd "{work}" && printf "2\\n" | bash ./docker/docker_run.sh'
+        run = ctx.ssh.exec_host(
+            run_cmd,
+            log=log,
+            timeout=900,
+            stream_output=True,
+            get_pty=True,
+        )
+        logs.append(run.combined)
+        if not run.ok:
+            return StepResult(
+                False,
+                f"docker_run.sh 失败 (exit={run.exit_code})",
+                "\n".join(logs),
+            )
+
+        verify = ctx.ssh.exec_host(
+            f'docker ps --format "{{{{.Names}}}}" | grep -Fx "{cname}" '
+            f'&& echo UP || echo DOWN',
+            log=log,
+            timeout=60,
+            stream_output=False,
+        )
+        logs.append(verify.combined)
+        if "UP" not in verify.combined:
+            return StepResult(
+                False,
+                f"docker_run 后容器 {cname} 未在运行",
+                "\n".join(logs),
+            )
+
+        ctx.dc["container_name"] = cname
+        ctx.ssh.container_name = cname
+        return StepResult(True, f"相机初始化完成，容器 {cname} 已重建并启动", "\n".join(logs))
 
 
 class CameraSnStep(TestStep):
@@ -418,21 +565,23 @@ class CameraBuildStep(TestStep):
         super().__init__(
             id="env_camera_build",
             title="相机相关代码编译",
-            description="编译 ros2_ws_4xx / ros2_ws_img_trans",
+            description=(
+                "依次编译 realsense2_camera_msgs → ros2_ws_4xx → ros2_ws_img_trans"
+            ),
             category="env",
         )
 
     def run(self, ctx: AppContext, log: LogFn) -> StepResult:
         cmds = [
+            "./script/build.sh -p realsense2_camera_msgs",
             "./script/build.sh -s sub_modules/sal/ros2_ws_4xx/src/ -c",
             "./script/build.sh -s sub_modules/sal/ros2_ws_img_trans/src/ -c",
         ]
-        logs = []
+        logs: list[str] = []
         for c in cmds:
             res = ctx.ssh.exec_docker(c, log=log, timeout=3600)
             logs.append(res.combined)
             if not res.ok:
-                log("首包失败时可尝试: ./script/build.sh -p realsense2_camera_msgs")
                 return StepResult(False, f"编译失败: {c}", "\n".join(logs))
         return StepResult(True, "相机包编译完成", "\n".join(logs))
 
