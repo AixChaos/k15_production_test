@@ -38,17 +38,23 @@ class AppContext:
     def ros(self) -> dict[str, Any]:
         return self.config.get("ros", {})
 
-    def ros_env_exports(self) -> str:
+    def ros_env_exports(self, domain_id: int | None = None) -> str:
         r = self.ros
+        did = r.get("domain_id", 40) if domain_id is None else domain_id
         return (
             f"export RMW_IMPLEMENTATION={r.get('rmw', 'rmw_cyclonedds_cpp')}; "
             f"export CYCLONEDDS_URI={r.get('cyclonedds_uri', '/anyverse/config/cyclonedds.xml')}; "
-            f"export ROS_DOMAIN_ID={r.get('domain_id', 40)}; "
+            f"export ROS_DOMAIN_ID={did}; "
             f"export ROS_LOCALHOST_ONLY={r.get('localhost_only', 0)}"
         )
 
     def source_ws(self) -> str:
-        return "source /opt/ros/humble/setup.bash 2>/dev/null || true; source .ws/devel/setup.bash"
+        # 域控镜像多为 jazzy；humble 仅作回退，避免错误 distro 干扰
+        return (
+            "source /opt/ros/jazzy/setup.bash 2>/dev/null || "
+            "source /opt/ros/humble/setup.bash 2>/dev/null || true; "
+            "source .ws/devel/setup.bash"
+        )
 
 
 def write_report(

@@ -13,14 +13,21 @@ class ChassisTopicTestStep(TestStep):
 
     LOCAL_SCRIPT = ROOT / "script" / "sensor_topic_test.py"
     REMOTE_SCRIPT = "/tmp/k15_sensor_topic_test.py"
+    # 底盘驱动默认跑在 domain 0；上位机跨机联调用的 40 会导致看不到 /driver/* topic
+    CHASSIS_DOMAIN_ID = 0
+    READY_TOPICS = (
+        "/driver/imu/RawData",
+        "/driver/lidar/lidar_front/point_cloud/Data",
+    )
+    READY_WAIT_SEC = 120
 
     def __init__(self) -> None:
         super().__init__(
             id="test_chassis_topic",
             title="底盘话题测试",
             description=(
-                "1) 编译 monkey_chassis_v2  2) source .ws/devel/setup.bash  "
-                "3) 执行 script/sensor_topic_test.py（日志实时输出）"
+                "1) 编译 monkey_chassis_v2  2) 等待驱动 topic（ROS_DOMAIN_ID=0）"
+                "  3) 执行 sensor_topic_test.py（日志实时输出）"
             ),
             category="test",
         )
@@ -30,9 +37,17 @@ class ChassisTopicTestStep(TestStep):
             return StepResult(False, f"本机缺少测试脚本: {self.LOCAL_SCRIPT}", "")
 
         logs: list[str] = []
+        domain = int(
+            (ctx.ros.get("chassis_domain_id", self.CHASSIS_DOMAIN_ID)
+             if isinstance(ctx.ros, dict)
+             else self.CHASSIS_DOMAIN_ID)
+            or self.CHASSIS_DOMAIN_ID
+        )
+        env = ctx.ros_env_exports(domain_id=domain)
+        source = ctx.source_ws()
 
         # —— 1 编译 ——
-        log("—— 1/2 编译底盘话题代码 ——")
+        log("—— 1/3 编译底盘话题代码 ——")
         build = ctx.ssh.exec_docker(
             "./script/build.sh -s src/robot_hardwares/monkey_chassis_v2",
             log=log,
@@ -44,8 +59,55 @@ class ChassisTopicTestStep(TestStep):
             return StepResult(False, f"底盘编译失败 (exit={build.exit_code})", "\n".join(logs))
         log("编译完成")
 
-        # —— 2 上传并执行测试脚本 ——
-        log("—— 2/2 执行底盘话题测试脚本 ——")
+        # —— 2 等待驱动 topic（必须与驱动同 domain，否则 echo 报 Could not determine the type）——
+        log(f"—— 2/3 等待驱动 topic 就绪（ROS_DOMAIN_ID={domain}，最长 {self.READY_WAIT_SEC}s）——")
+        topics_check = " ".join(self.READY_TOPICS)
+        wait_cmd = textwrap.dedent(
+            f"""
+            set +e
+            {source}
+            {env}
+            deadline=$(( $(date +%s) + {self.READY_WAIT_SEC} ))
+            list=""
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+              list=$(ros2 topic list 2>/dev/null || true)
+              ok=1
+              for t in {topics_check}; do
+                echo "$list" | grep -Fx "$t" >/dev/null 2>&1 || ok=0
+              done
+              if [ "$ok" = 1 ]; then
+                echo TOPICS_READY
+                echo "$list" | grep -E '^/driver/' | head -30
+                exit 0
+              fi
+              sleep 2
+            done
+            echo TOPICS_TIMEOUT
+            echo "--- current topic list (domain={domain}) ---"
+            echo "$list"
+            exit 1
+            """
+        ).strip()
+        wait = ctx.ssh.exec_docker(
+            wait_cmd,
+            log=log,
+            timeout=self.READY_WAIT_SEC + 60,
+            stream_output=True,
+        )
+        logs.append(wait.combined)
+        if "TOPICS_READY" not in wait.combined:
+            return StepResult(
+                False,
+                (
+                    f"驱动 topic 未就绪（ROS_DOMAIN_ID={domain}）。"
+                    "请确认底盘驱动已启动，且与测试使用同一 domain"
+                ),
+                "\n".join(logs),
+            )
+        log("驱动 topic 已就绪")
+
+        # —— 3 上传并执行测试脚本 ——
+        log("—— 3/3 执行底盘话题测试脚本 ——")
         try:
             content = self.LOCAL_SCRIPT.read_text(encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
@@ -67,13 +129,11 @@ class ChassisTopicTestStep(TestStep):
         if not cp.ok:
             return StepResult(False, "拷贝测试脚本到容器失败", cp.combined)
 
-        # source 工作空间后执行；--yes 避免交互卡住
         run_cmd = (
-            f"{ctx.source_ws()} && "
-            f"{ctx.ros_env_exports()} && "
+            f"{source} && {env} && "
             f"python3 {self.REMOTE_SCRIPT} --hz --bw --yes"
         )
-        log("开始运行 sensor_topic_test.py …")
+        log(f"开始运行 sensor_topic_test.py（ROS_DOMAIN_ID={domain}）…")
         res = ctx.ssh.exec_docker(
             run_cmd,
             log=log,

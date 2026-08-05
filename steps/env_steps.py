@@ -273,15 +273,19 @@ class EnvPackageDeployStep(TestStep):
             find "{home}/.ssh" -type f -name 'id_*' ! -name '*.pub' -exec chmod 600 {{}} +
             find "{home}/.ssh" -type f -name '*.pub' -exec chmod 644 {{}} +
             # 预写入 GitLab host key，避免编译时并行 git fetch 卡在 yes/no 提示
+            # 不用 -H：明文主机名便于校验；用 ssh-keygen -F 判断是否已存在（兼容哈希条目）
             touch "{home}/.ssh/known_hosts"
             chmod 644 "{home}/.ssh/known_hosts"
-            if ! grep -qF "{git_host}" "{home}/.ssh/known_hosts" 2>/dev/null; then
-              ssh-keyscan -H "{git_host}" >> "{home}/.ssh/known_hosts" 2>/dev/null || true
+            if ! ssh-keygen -F "{git_host}" -f "{home}/.ssh/known_hosts" >/dev/null 2>&1; then
+              ssh-keyscan -T 15 "{git_host}" >> "{home}/.ssh/known_hosts" 2>/tmp/k15_keyscan.err || true
             fi
-            if ! grep -qF "{git_host}" "{home}/.ssh/known_hosts" 2>/dev/null; then
-              echo "WARN: ssh-keyscan {git_host} 未写入 known_hosts（网络或 DNS 可能不可达）"
-            else
+            if ssh-keygen -F "{git_host}" -f "{home}/.ssh/known_hosts" >/dev/null 2>&1; then
               echo "KNOWN_HOSTS_OK {git_host}"
+            else
+              echo "WARN: ssh-keyscan {git_host} 未写入 known_hosts（网络或 DNS 可能不可达）"
+              if [ -s /tmp/k15_keyscan.err ]; then
+                echo "WARN_DETAIL: $(tr '\\n' ' ' </tmp/k15_keyscan.err)"
+              fi
             fi
             chown -R "{user}:{user}" "{home}/.ssh" 2>/dev/null || true
             echo OK
@@ -295,7 +299,17 @@ class EnvPackageDeployStep(TestStep):
         if "KNOWN_HOSTS_OK" in res_key.combined:
             log(f"SSH 密钥已安装，known_hosts 已加入 {git_host}")
         else:
-            log(f"SSH 密钥已安装；警告: 未能写入 {git_host} 到 known_hosts，编译时可能出现 SSH 确认提示")
+            detail = ""
+            for line in res_key.combined.splitlines():
+                if line.startswith("WARN_DETAIL:"):
+                    detail = line[len("WARN_DETAIL:") :].strip()
+                    break
+            msg = f"SSH 密钥已安装；警告: 未能写入 {git_host} 到 known_hosts"
+            if detail:
+                msg += f"（{detail}）"
+            else:
+                msg += "，编译时可能出现 SSH 确认提示"
+            log(msg)
 
         # —— 4 解压代码包 ——
         self._stage(log, 4, "解压代码包到 work 目录")
@@ -439,7 +453,7 @@ class CameraInitStep(TestStep):
             title="相机初始化配置",
             description=(
                 "若 agent_dev_nvidia 在运行则先 docker stop → "
-                "anyverse_config_init.sh → docker_run.sh 选 2 重建并启动容器"
+                "anyverse_config_init.sh → docker_run.sh 选 2 并确认 y 重建启动容器"
             ),
             category="env",
             dangerous=True,
@@ -490,9 +504,9 @@ class CameraInitStep(TestStep):
                 "\n".join(logs),
             )
 
-        # docker_run.sh 为交互菜单：选 2 = 重建容器并启动
-        log("执行 docker_run.sh（菜单选项 2：重建并启动容器）…")
-        run_cmd = f'cd "{work}" && printf "2\\n" | bash ./docker/docker_run.sh'
+        # docker_run.sh 交互：先选 2 重建，再输入 y 确认删除
+        log("执行 docker_run.sh（选 2 重建并输入 y 确认）…")
+        run_cmd = f'cd "{work}" && printf "2\\ny\\n" | bash ./docker/docker_run.sh'
         run = ctx.ssh.exec_host(
             run_cmd,
             log=log,

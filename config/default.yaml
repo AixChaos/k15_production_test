@@ -1,59 +1,48 @@
-# K15 生产测试上位机默认配置（Ubuntu 22.04）
-# 本机仅展示日志；所有命令通过 SSH + docker exec 在域控执行。
-
 domain_controller:
-  # 最近一次填写的域控 IP（填写后自动记住，不会主动清空）
-  host: ""
-  # 历史填写记录（下拉可选）
-  host_history: []
+  host: 10.20.0.8
+  host_history:
+  - 10.20.0.8
+  - 10.20.0.13
+  - 10.20.8.50
+  - 10.20.0.4
   port: 22
-  user: "nvidia"
-  password: "nvidia"
-  key_filename: ""
-  # 宿主机上 anyverse 仓库路径
-  host_work_dir: "/home/nvidia/work/anyverse"
-  # Docker 容器名（docker ps 可见）；留空则自动匹配含 anyverse 的容器
-  container_name: ""
-  # 容器内工作目录
-  container_work_dir: "/anyverse"
-
+  user: nvidia
+  password: nvidia
+  key_filename: ''
+  host_work_dir: /home/nvidia/work/anyverse
+  container_name: agent_dev_nvidia
+  container_work_dir: /anyverse
+  container_user: admin
 pc:
-  # 启动时自动探测网线 IP；以下为占位
-  ip: ""
-  user: "wujie"
-  password: "123456"
-  cyclonedds_path: ""
-
+  ip: 10.20.0.3
+  user: wujie
+  password: '123456'
+  cyclonedds_path: ''
 ros:
   domain_id: 40
   localhost_only: 0
-  rmw: "rmw_cyclonedds_cpp"
-  cyclonedds_uri: "/anyverse/config/cyclonedds.xml"
-  # 域控 DDS 网卡名（文档示例 eth5）
-  network_interface: "eth5"
-
+  rmw: rmw_cyclonedds_cpp
+  cyclonedds_uri: /anyverse/config/cyclonedds.xml
+  network_interface: eth5
 git:
-  branch: "dev/pnc"
-  repo: "git@gitlab.anyverse.work:dev/anyverse.git"
-  host_clone_parent: "/home/nvidia/work"
-
+  branch: dev/pnc
+  repo: git@gitlab.anyverse.work:dev/anyverse.git
+  host_clone_parent: /home/nvidia/work
 docker:
-  daemon_json_path: "/etc/docker/daemon.json"
+  daemon_json_path: /etc/docker/daemon.json
   registry_mirrors:
-    - "https://docker.xuanyuan.me"
-    - "https://docker.1ms.run"
-    - "https://hub.rat.dev"
-    - "https://registry.docker-cn.com"
+  - https://docker.xuanyuan.me
+  - https://docker.1ms.run
+  - https://hub.rat.dev
+  - https://registry.docker-cn.com
   insecure_registries:
-    - "docker.anyverse.work"
-    - "registry.docker-cn.com"
-
+  - docker.anyverse.work
+  - registry.docker-cn.com
 moveit:
-  moveit_config_package: "kitt_1_5_robot_with_zx90d_moveit"
-  controller_package: "hardware_integration"
-  controller_launch: "controller.launch.py"
-  latency_script: "controller_state_latency6.py"
-  hw_params_relpath: "src/pnc/config/moveit_config/kitt_1_5_robot_with_zx90d_moveit/config/kitt_1_5_robot_with_zx90d_hw_params.yaml"
-
+  moveit_config_package: kitt_1_5_robot_with_zx90d_moveit
+  controller_package: hardware_integration
+  controller_launch: controller.launch.py
+  latency_script: controller_state_latency6.py
+  hw_params_relpath: src/pnc/config/moveit_config/kitt_1_5_robot_with_zx90d_moveit/config/kitt_1_5_robot_with_zx90d_hw_params.yaml
 report:
-  output_dir: "reports"
+  output_dir: reports
