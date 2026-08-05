@@ -465,16 +465,19 @@ class CameraInitStep(TestStep):
         logs: list[str] = []
 
         log(f"检查容器是否在运行: {cname}")
+        # 注意：勿用含 RUNNING 的 NOT_RUNNING 再做子串判断（"RUNNING" in "NOT_RUNNING" 恒为真）
         check = ctx.ssh.exec_host(
-            f'docker ps --format "{{{{.Names}}}}" | grep -Fx "{cname}" '
-            f'&& echo RUNNING || echo NOT_RUNNING',
+            f'docker inspect -f "{{{{.State.Running}}}}" "{cname}" 2>/dev/null '
+            f'|| echo missing',
             log=log,
             timeout=60,
             stream_output=False,
         )
         logs.append(check.combined)
+        state = (check.stdout or check.combined or "").strip().splitlines()
+        state_line = (state[-1] if state else "").strip().lower()
 
-        if "RUNNING" in check.combined:
+        if state_line == "true":
             log(f"容器 {cname} 正在运行，先停止…")
             stop = ctx.ssh.exec_host(
                 f'docker stop "{cname}"',
@@ -491,8 +494,8 @@ class CameraInitStep(TestStep):
                 )
             log(f"容器 {cname} 已停止")
         else:
-            log(f"容器 {cname} 未在运行，直接执行初始化脚本")
-
+            # false=已存在但未运行；missing=不存在 —— 都无需 stop
+            log(f"容器 {cname} 未在运行（{state_line or 'unknown'}），跳过停止")
         log("执行 anyverse_config_init.sh …")
         cmd = f'cd "{work}" && sudo ./script/anyverse_config_init.sh'
         res = ctx.ssh.exec_host(cmd, log=log, timeout=600, stream_output=True)
@@ -523,14 +526,15 @@ class CameraInitStep(TestStep):
             )
 
         verify = ctx.ssh.exec_host(
-            f'docker ps --format "{{{{.Names}}}}" | grep -Fx "{cname}" '
-            f'&& echo UP || echo DOWN',
+            f'docker inspect -f "{{{{.State.Running}}}}" "{cname}" 2>/dev/null '
+            f'|| echo missing',
             log=log,
             timeout=60,
             stream_output=False,
         )
         logs.append(verify.combined)
-        if "UP" not in verify.combined:
+        vlines = (verify.stdout or verify.combined or "").strip().splitlines()
+        if (vlines[-1] if vlines else "").strip().lower() != "true":
             return StepResult(
                 False,
                 f"docker_run 后容器 {cname} 未在运行",

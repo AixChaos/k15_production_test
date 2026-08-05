@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
@@ -41,6 +42,8 @@ from ui.upload_progress_dialog import UploadProgressDialog
 
 class StepWorker(QThread):
     log_line = Signal(str)
+    log_channel = Signal(str, str)  # channel, message
+    log_layout = Signal(str)  # "single" | "triple"
     # 字节数可能超过 2GB，不能用 Qt int（有符号 32 位），改用 object 传 Python int
     upload_begin = Signal(str, object)  # filename, total_bytes
     upload_progress = Signal(int, object, object, str)  # pct, done, total, speed
@@ -56,7 +59,15 @@ class StepWorker(QThread):
         def _log(msg: str) -> None:
             self.log_line.emit(msg)
 
+        def _log_channel(channel: str, msg: str) -> None:
+            self.log_channel.emit(channel, msg)
+
+        def _set_layout(mode: str) -> None:
+            self.log_layout.emit(mode)
+
         self.ctx.log = _log
+        self.ctx.log_channel = _log_channel
+        self.ctx.set_log_layout = _set_layout
         self.ctx.on_upload_begin = lambda name, total: self.upload_begin.emit(name, int(total))
         self.ctx.on_upload_progress = (
             lambda pct, done, total, speed: self.upload_progress.emit(
@@ -282,14 +293,67 @@ class MainWindow(QMainWindow):
         right = QWidget()
         right_l = QVBoxLayout(right)
         right_l.setContentsMargins(0, 0, 0, 0)
-        right_l.addWidget(QLabel("实时日志"))
+        self.log_title = QLabel("实时日志")
+        right_l.addWidget(self.log_title)
+
+        self.log_stack = QStackedWidget()
+
+        # 单栏（默认）
+        single_page = QWidget()
+        single_l = QVBoxLayout(single_page)
+        single_l.setContentsMargins(0, 0, 0, 0)
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
-        right_l.addWidget(self.log_view, 1)
+        single_l.addWidget(self.log_view, 1)
+        self.log_stack.addWidget(single_page)
+
+        # 三栏（关节时延：Controller / MoveIt / Latency）
+        triple_page = QWidget()
+        triple_l = QVBoxLayout(triple_page)
+        triple_l.setContentsMargins(0, 0, 0, 0)
+        self.triple_status = QLabel("三栏就绪后将只显示各进程日志")
+        self.triple_status.setObjectName("hint")
+        self.triple_status.setWordWrap(True)
+        triple_l.addWidget(self.triple_status)
+        self.log_channel_views: dict[str, QTextEdit] = {}
+        self.log_triple_splitter = QSplitter()
+        for key, title, color in (
+            ("controller", "Controller（域控）", "#4fc3f7"),
+            ("moveit", "MoveIt（本机）", "#81c784"),
+            ("latency", "Latency（时延）", "#ffb74d"),
+        ):
+            col = QWidget()
+            col_l = QVBoxLayout(col)
+            col_l.setContentsMargins(0, 0, 0, 0)
+            col_l.setSpacing(4)
+            hdr = QLabel(title)
+            hdr.setObjectName("logPaneHeader")
+            hdr.setStyleSheet(f"color: {color}; font-weight: 600;")
+            view = QTextEdit()
+            view.setReadOnly(True)
+            col_l.addWidget(hdr)
+            col_l.addWidget(view, 1)
+            self.log_channel_views[key] = view
+            self.log_triple_splitter.addWidget(col)
+        self.log_triple_splitter.setStretchFactor(0, 1)
+        self.log_triple_splitter.setStretchFactor(1, 1)
+        self.log_triple_splitter.setStretchFactor(2, 1)
+        triple_l.addWidget(self.log_triple_splitter, 1)
+        self.log_stack.addWidget(triple_page)
+        self.log_stack.setCurrentIndex(0)
+        self._log_layout_mode = "single"
+
+        right_l.addWidget(self.log_stack, 1)
         log_btns = QHBoxLayout()
+        self.btn_finish_test = QPushButton("测试完成（停止三路）")
+        self.btn_finish_test.setObjectName("success")
+        self.btn_finish_test.setEnabled(False)
+        self.btn_finish_test.setToolTip("关节时延测试运行中可点：停止 Controller / MoveIt / Latency")
+        self.btn_finish_test.clicked.connect(self.on_finish_joint_test)
         self.btn_clear_log = QPushButton("清空日志")
         self.btn_clear_log.setObjectName("ghost")
-        self.btn_clear_log.clicked.connect(self.log_view.clear)
+        self.btn_clear_log.clicked.connect(self.clear_logs)
+        log_btns.addWidget(self.btn_finish_test)
         log_btns.addStretch()
         log_btns.addWidget(self.btn_clear_log)
         right_l.addLayout(log_btns)
@@ -441,10 +505,6 @@ class MainWindow(QMainWindow):
                 StepStatus.MANUAL: "!",
             }.get(step.status, "○")
             text = f"{mark} {i}. {step.title}"
-            if step.dangerous:
-                text += "  [慎]"
-            if step.needs_manual:
-                text += "  [人工]"
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, step.id)
             color = STATUS_COLORS.get(step.status.value, "#9aa0a6")
@@ -469,12 +529,100 @@ class MainWindow(QMainWindow):
         self.conn_label.style().unpolish(self.conn_label)
         self.conn_label.style().polish(self.conn_label)
 
-    def append_log(self, msg: str) -> None:
-        for view in (getattr(self, "conn_log_view", None), getattr(self, "log_view", None)):
+    def clear_logs(self) -> None:
+        self.log_view.clear()
+        for view in getattr(self, "log_channel_views", {}).values():
+            view.clear()
+
+    def set_log_layout(self, mode: str) -> None:
+        mode = (mode or "single").strip().lower()
+        if mode not in ("single", "triple"):
+            mode = "single"
+        self._log_layout_mode = mode
+        if mode == "triple":
+            self.log_title.setText("实时日志 · 三路分栏（各栏仅本进程日志）")
+            for view in self.log_channel_views.values():
+                view.clear()
+            if hasattr(self, "triple_status"):
+                self.triple_status.setText("等待三路启动…")
+            self.log_stack.setCurrentIndex(1)
+            # 关节时延运行中才允许点「测试完成」
+            if getattr(self, "_busy", False) and getattr(self, "worker", None):
+                step = getattr(self.worker, "step", None)
+                if step is not None and getattr(step, "id", "") == "test_joint_latency":
+                    self.btn_finish_test.setEnabled(True)
+        else:
+            self.log_title.setText("实时日志")
+            self.log_stack.setCurrentIndex(0)
+            self.btn_finish_test.setEnabled(False)
+
+    def append_channel_log(self, channel: str, msg: str) -> None:
+        """channel: controller|moveit|latency → 对应栏；status → 状态条。"""
+        if channel == "status":
+            if hasattr(self, "triple_status"):
+                self.triple_status.setText(msg)
+            return
+        view = self.log_channel_views.get(channel)
+        if view is None:
+            # 未知通道：不写三栏，落到主日志（若在单栏）或忽略
+            if self._log_layout_mode != "triple":
+                self.log_view.append(msg)
+                self.log_view.moveCursor(QTextCursor.MoveOperation.End)
+            return
+        view.append(msg)
+        view.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _append_to_text_views(self, msg: str, *views: object) -> None:
+        import html
+
+        color = None
+        if msg.startswith("[Controller]"):
+            color = "#4fc3f7"
+        elif msg.startswith("[MoveIt]"):
+            color = "#81c784"
+        elif msg.startswith("[Latency]"):
+            color = "#ffb74d"
+        elif msg.startswith("[系统]"):
+            color = "#ce93d8"
+        elif msg.startswith("═") or msg.startswith("─"):
+            color = "#90a4ae"
+
+        for view in views:
             if view is None:
                 continue
-            view.append(msg)
+            if color:
+                view.append(
+                    f'<span style="color:{color};font-family:Consolas,monospace;">'
+                    f"{html.escape(msg)}</span>"
+                )
+            else:
+                view.append(msg)
             view.moveCursor(QTextCursor.MoveOperation.End)
+
+    def append_log(self, msg: str) -> None:
+        # 三栏模式：进程日志进对应栏；系统日志进状态条，并始终镜像到连接页日志
+        if getattr(self, "_log_layout_mode", "single") == "triple":
+            if msg.startswith("[Controller]"):
+                body = msg.split(" ", 1)[1] if " " in msg else msg
+                self.append_channel_log("controller", body.strip())
+                return
+            if msg.startswith("[MoveIt]"):
+                body = msg.split(" ", 1)[1] if " " in msg else msg
+                self.append_channel_log("moveit", body.strip())
+                return
+            if msg.startswith("[Latency]"):
+                body = msg.split(" ", 1)[1] if " " in msg else msg
+                self.append_channel_log("latency", body.strip())
+                return
+            self.append_channel_log("status", msg.strip() or msg)
+            self._append_to_text_views(msg, getattr(self, "conn_log_view", None))
+            return
+
+        self._append_to_text_views(
+            msg,
+            getattr(self, "conn_log_view", None),
+            getattr(self, "log_view", None),
+        )
 
     def make_ctx(self) -> AppContext:
         if not self.ssh or not self.ssh.connected:
@@ -488,6 +636,22 @@ class MainWindow(QMainWindow):
         )
         self.ssh.container_user = str(dc.get("container_user", "admin") or "admin")
         return AppContext(config=self.config, ssh=self.ssh, log=self.append_log)
+
+    @Slot()
+    def on_finish_joint_test(self) -> None:
+        """关节时延运行中：通知步骤侧停止三路并结束等待。"""
+        w = self.worker
+        if not w or not getattr(self, "_busy", False):
+            return
+        step = getattr(w, "step", None)
+        if step is None or getattr(step, "id", "") != "test_joint_latency":
+            return
+        ctx = getattr(w, "ctx", None)
+        if ctx is None:
+            return
+        ctx.finish_event.set()
+        self.btn_finish_test.setEnabled(False)
+        self.append_channel_log("status", "已请求测试完成，正在停止三路…")
 
     @Slot()
     def on_selection_changed(self, *_args) -> None:
@@ -627,12 +791,15 @@ class MainWindow(QMainWindow):
             try:
                 name = client.resolve_container(log=self.append_log)
                 self.config.setdefault("domain_controller", {})["container_name"] = name
+                # 域控重启后容器常因 jtop.sock 未就绪而未起来，连接时一并拉起
+                client.ensure_container_running(log=self.append_log)
             except Exception as exc:  # noqa: BLE001
-                self.append_log(f"提示: 暂未解析到容器 ({exc})，可先完成环境压缩包部署后再连接")
+                self.append_log(f"提示: 容器未就绪 ({exc})，SSH 已连通，可先完成环境部署后再测")
             if self.ssh:
                 self.ssh.close()
             self.ssh = client
             self._set_connection_status(True)
+            self.append_log(f"连接成功: {self.user_edit.text().strip() or 'nvidia'}@{host}")
             save_config(self.config)
         except Exception as exc:  # noqa: BLE001
             self._set_connection_status(False)
@@ -725,11 +892,19 @@ class MainWindow(QMainWindow):
         self._busy = True
         step.status = StepStatus.RUNNING
         self._refresh_lists()
+        # 非关节时延步骤恢复单栏；三栏由该步骤自行切换并保留到下次执行
+        if step.id != "test_joint_latency":
+            self.set_log_layout("single")
+            self.btn_finish_test.setEnabled(False)
+        else:
+            self.btn_finish_test.setEnabled(True)
         self.append_log(f"\n======== 开始: {step.title} ========")
         self.btn_run.setEnabled(False)
 
         self.worker = StepWorker(step, ctx)
         self.worker.log_line.connect(self.append_log)
+        self.worker.log_channel.connect(self.append_channel_log)
+        self.worker.log_layout.connect(self.set_log_layout)
         self.worker.upload_begin.connect(self.on_upload_begin)
         self.worker.upload_progress.connect(self.on_upload_progress)
         self.worker.upload_end.connect(self.on_upload_end)
@@ -740,6 +915,7 @@ class MainWindow(QMainWindow):
     def on_step_finished(self, step_id: str, result: object) -> None:
         self._busy = False
         self.btn_run.setEnabled(True)
+        self.btn_finish_test.setEnabled(False)
         step = self.step_map[step_id]
         assert isinstance(result, StepResult)
         step.last_message = result.message

@@ -1,6 +1,8 @@
 domain_controller:
-  host: 10.20.0.8
+  host: 10.20.0.18
   host_history:
+  - 10.20.0.18
+  - 10.20.0.11
   - 10.20.0.8
   - 10.20.0.13
   - 10.20.8.50
@@ -18,8 +20,13 @@ pc:
   user: wujie
   password: '123456'
   cyclonedds_path: ''
+  work_dir: /home/wujie/work/anyverse
+  container_name: agent_dev_wujie
+  container_user: admin
+  container_work_dir: /anyverse
 ros:
-  domain_id: 40
+  domain_id: 0
+  bridge_domain_id: 0
   localhost_only: 0
   rmw: rmw_cyclonedds_cpp
   cyclonedds_uri: /anyverse/config/cyclonedds.xml
@@ -40,9 +47,12 @@ docker:
   - registry.docker-cn.com
 moveit:
   moveit_config_package: kitt_1_5_robot_with_zx90d_moveit
+  moveit_demo_launch: moveit_demo.launch.py
   controller_package: hardware_integration
   controller_launch: controller.launch.py
   latency_script: controller_state_latency6.py
   hw_params_relpath: src/pnc/config/moveit_config/kitt_1_5_robot_with_zx90d_moveit/config/kitt_1_5_robot_with_zx90d_hw_params.yaml
 report:
   output_dir: reports
+env_package:
+  local_path: /home/wujie/下载/K15_env_con.tar.gz

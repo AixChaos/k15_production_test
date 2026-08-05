@@ -149,6 +149,77 @@ class SshClient:
         code = chan.recv_exit_status()
         return ExecResult(code, "\n".join(out_chunks), "\n".join(err_chunks))
 
+    def ensure_container_running(
+        self,
+        log: LogFn | None = None,
+        retries: int = 5,
+    ) -> str:
+        """确保配置的容器在运行；域控重启后常因 jtop.sock 未就绪而 start 失败，会等待重试。"""
+
+        def _log(msg: str) -> None:
+            if log:
+                log(msg)
+
+        name = self.resolve_container(log=log)
+        check = self.exec_host(
+            f'docker inspect -f "{{{{.State.Running}}}}" "{name}" 2>/dev/null '
+            f'|| echo missing',
+            log=None,
+            timeout=60,
+            stream_output=False,
+        )
+        state_line = (check.stdout or "").strip().splitlines()
+        state = (state_line[-1] if state_line else "").strip().lower()
+        if state == "true":
+            _log(f"容器 {name} 已在运行")
+            return name
+        if state == "missing":
+            raise RuntimeError(f"容器 {name} 不存在，请先完成环境配置中的容器部署")
+
+        _log(f"容器 {name} 未运行（重启后常见），等待 jtop.sock 并启动…")
+        wait = self.exec_host(
+            "for i in $(seq 1 20); do "
+            "[ -S /run/jtop.sock ] && echo jtop_ok && exit 0; "
+            "sleep 1; done; echo jtop_missing; exit 1",
+            log=None,
+            timeout=40,
+            stream_output=False,
+        )
+        if "jtop_ok" not in (wait.stdout or ""):
+            _log("警告: /run/jtop.sock 尚未就绪，仍尝试 docker start")
+
+        last_err = ""
+        for attempt in range(1, retries + 1):
+            start = self.exec_host(
+                f'docker start "{name}"',
+                log=None,
+                timeout=120,
+                stream_output=False,
+            )
+            time.sleep(1.5)
+            verify = self.exec_host(
+                f'docker inspect -f "{{{{.State.Running}}}}" "{name}" 2>/dev/null '
+                f'|| echo false',
+                log=None,
+                timeout=30,
+                stream_output=False,
+            )
+            vlines = (verify.stdout or "").strip().splitlines()
+            running = (vlines[-1] if vlines else "").strip().lower() == "true"
+            if running:
+                _log(f"容器 {name} 已启动")
+                return name
+            err = self.exec_host(
+                f'docker inspect -f "{{{{.State.Error}}}}" "{name}" 2>/dev/null || true',
+                log=None,
+                timeout=30,
+                stream_output=False,
+            )
+            last_err = (err.stdout or start.combined or "").strip()
+            _log(f"启动尝试 {attempt}/{retries} 未成功: {last_err[:200]}")
+            time.sleep(2)
+        raise RuntimeError(f"无法启动容器 {name}: {last_err[:300]}")
+
     def resolve_container(self, log: LogFn | None = None) -> str:
         if self.container_name:
             return self.container_name
@@ -247,12 +318,29 @@ class SshClient:
         content: str,
         sudo: bool = False,
         log: LogFn | None = None,
+        *,
+        inplace: bool = False,
     ) -> ExecResult:
-        # 通过 SFTP 写临时文件再移动，避免复杂转义
+        """写入远端文件。
+
+        inplace=True：直接覆盖已有路径内容（不换 inode）。
+        用于被 docker 单文件 bind-mount 的配置（如 cyclonedds_thor.xml），
+        避免 mv/docker cp 触发 device or resource busy / 挂载脱节。
+        """
         client = self.ensure()
         sftp = client.open_sftp()
-        tmp = f"/tmp/k15_upload_{int(time.time() * 1000)}"
         try:
+            if inplace and not sudo:
+                with sftp.file(remote_path, "w") as f:
+                    f.write(content)
+                try:
+                    sftp.chmod(remote_path, 0o644)
+                except Exception:  # noqa: BLE001
+                    pass
+                return ExecResult(0, "OK", "")
+
+            # 通过 SFTP 写临时文件再移动，避免复杂转义
+            tmp = f"/tmp/k15_upload_{int(time.time() * 1000)}"
             with sftp.file(tmp, "w") as f:
                 f.write(content)
             if sudo:
@@ -485,6 +573,8 @@ class SshClient:
         ok = False
         try:
             # —— 1) rsync ——
+            # 大压缩包整文件上传：必须 -W/--whole-file，否则 LAN 上仍跑 delta
+            # 校验，吞吐常被压到 ~20MB/s；关压缩避免二次 gzip。
             if shutil.which("rsync") and (shutil.which("sshpass") or not use_password):
                 ssh_e = "ssh " + " ".join(self._ssh_cli_opts(for_scp=False))
                 for dest in dest_candidates:
@@ -492,6 +582,8 @@ class SshClient:
                     argv = [
                         "rsync",
                         "-a",
+                        "-W",
+                        "--whole-file",
                         "--inplace",
                         "--partial",
                         "--info=progress2",
@@ -500,6 +592,9 @@ class SshClient:
                         str(local),
                         remote_spec,
                     ]
+                    if log:
+                        log("使用 rsync 整文件传输（-W）…")
+                    t0 = time.time()
                     res = self._run_cli_transfer(
                         argv,
                         use_password=use_password,
@@ -513,10 +608,18 @@ class SshClient:
                             placed = _place_from_tmp()
                             if not placed.ok:
                                 return placed
+                        elapsed = max(time.time() - t0, 1e-3)
+                        mbps = (total / (1024 * 1024)) / elapsed
                         if log:
-                            log("上传完成")
+                            log(f"上传完成（rsync，平均 {mbps:.1f} MB/s）")
                         ok = True
-                        return ExecResult(0, f"uploaded via rsync -> {remote_path}", "")
+                        return ExecResult(
+                            0,
+                            f"uploaded via rsync -> {remote_path} ({mbps:.1f}MB/s)",
+                            "",
+                        )
+                    if log:
+                        log(f"rsync 失败，尝试下一目标或 scp… ({(res.stderr or res.stdout)[:200]})")
                     if log and dest == remote_path:
                         log("直达目标失败，改传到临时目录后再放置…")
 
@@ -532,6 +635,7 @@ class SshClient:
                     ]
                     if log:
                         log("正在通过 scp 上传…")
+                    t0 = time.time()
                     res = self._run_cli_transfer(
                         argv,
                         use_password=use_password,
@@ -547,10 +651,14 @@ class SshClient:
                             placed = _place_from_tmp()
                             if not placed.ok:
                                 return placed
+                        elapsed = max(time.time() - t0, 1e-3)
+                        mbps = (total / (1024 * 1024)) / elapsed
                         if log:
-                            log("上传完成")
+                            log(f"上传完成（scp，平均 {mbps:.1f} MB/s）")
                         ok = True
-                        return ExecResult(0, f"uploaded via scp -> {remote_path}", "")
+                        return ExecResult(
+                            0, f"uploaded via scp -> {remote_path} ({mbps:.1f}MB/s)", ""
+                        )
                     if log and dest == remote_path:
                         log("scp 直达失败，改临时目录…")
 
