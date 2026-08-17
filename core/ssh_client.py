@@ -149,6 +149,70 @@ class SshClient:
         code = chan.recv_exit_status()
         return ExecResult(code, "\n".join(out_chunks), "\n".join(err_chunks))
 
+    def _fix_jtop_sock(
+        self,
+        log: LogFn | None = None,
+        wait_seconds: int = 0,
+    ) -> bool:
+        """修复宿主机 /run/jtop.sock；返回 True 表示曾是异常目录（需重启容器）。
+
+        wait_seconds>0 时才轮询等待 socket（仅在需要 docker start 时使用）。
+        使用 sudo -n，避免无 TTY 时 sudo 要密码把调用方卡死。
+        """
+
+        def _log(msg: str) -> None:
+            if log:
+                log(msg)
+
+        probe = self.exec_host(
+            "if [ -S /run/jtop.sock ]; then echo SOCK_OK; "
+            "elif [ -d /run/jtop.sock ]; then echo SOCK_DIR; "
+            "elif [ -e /run/jtop.sock ]; then echo SOCK_OTHER; "
+            "else echo SOCK_MISS; fi",
+            log=None,
+            timeout=15,
+            stream_output=False,
+        )
+        kind = (probe.stdout or "").strip().splitlines()
+        kind_s = (kind[-1] if kind else "").strip()
+        if kind_s == "SOCK_OK":
+            return False
+
+        was_dir = kind_s == "SOCK_DIR"
+        if was_dir:
+            _log("发现 /run/jtop.sock 是目录（异常），正在删除…")
+            self.exec_host(
+                "sudo -n rm -rf /run/jtop.sock 2>/dev/null || "
+                "rm -rf /run/jtop.sock 2>/dev/null || true",
+                log=None,
+                timeout=15,
+                stream_output=False,
+            )
+
+        if wait_seconds <= 0:
+            return was_dir
+
+        # 非交互启动 jtop（失败则忽略，由后续 wait / docker start 体现）
+        self.exec_host(
+            "command -v systemctl >/dev/null 2>&1 && "
+            "{ sudo -n systemctl start jtop 2>/dev/null || "
+            "sudo -n systemctl start jtop.service 2>/dev/null || true; } || true",
+            log=None,
+            timeout=20,
+            stream_output=False,
+        )
+        wait = self.exec_host(
+            f"for i in $(seq 1 {max(1, int(wait_seconds))}); do "
+            "[ -S /run/jtop.sock ] && echo jtop_ok && exit 0; "
+            "sleep 1; done; echo jtop_missing; exit 1",
+            log=None,
+            timeout=max(15, int(wait_seconds) + 10),
+            stream_output=False,
+        )
+        if "jtop_ok" not in (wait.stdout or ""):
+            _log("警告: /run/jtop.sock 尚未就绪（应为 unix socket）")
+        return was_dir
+
     def ensure_container_running(
         self,
         log: LogFn | None = None,
@@ -165,35 +229,39 @@ class SshClient:
             f'docker inspect -f "{{{{.State.Running}}}}" "{name}" 2>/dev/null '
             f'|| echo missing',
             log=None,
-            timeout=60,
+            timeout=30,
             stream_output=False,
         )
         state_line = (check.stdout or "").strip().splitlines()
         state = (state_line[-1] if state_line else "").strip().lower()
-        if state == "true":
-            _log(f"容器 {name} 已在运行")
-            return name
         if state == "missing":
             raise RuntimeError(f"容器 {name} 不存在，请先完成环境配置中的容器部署")
 
-        _log(f"容器 {name} 未运行（重启后常见），等待 jtop.sock 并启动…")
-        wait = self.exec_host(
-            "for i in $(seq 1 20); do "
-            "[ -S /run/jtop.sock ] && echo jtop_ok && exit 0; "
-            "sleep 1; done; echo jtop_missing; exit 1",
-            log=None,
-            timeout=40,
-            stream_output=False,
-        )
-        if "jtop_ok" not in (wait.stdout or ""):
-            _log("警告: /run/jtop.sock 尚未就绪，仍尝试 docker start")
+        # 已运行：只快速探测 sock 是否被误建成目录，不长时间等待
+        if state == "true":
+            sock_was_dir = self._fix_jtop_sock(log=log, wait_seconds=0)
+            if not sock_was_dir:
+                _log(f"容器 {name} 已在运行")
+                return name
+            _log(f"jtop.sock 曾是异常目录，重启容器 {name} 以重新挂载…")
+            self.exec_host(
+                f'docker stop "{name}"',
+                log=None,
+                timeout=60,
+                stream_output=False,
+            )
+            time.sleep(1)
+        else:
+            _log(f"容器 {name} 未运行（重启后常见），等待 jtop.sock 并启动…")
+
+        self._fix_jtop_sock(log=log, wait_seconds=15)
 
         last_err = ""
         for attempt in range(1, retries + 1):
             start = self.exec_host(
                 f'docker start "{name}"',
                 log=None,
-                timeout=120,
+                timeout=60,
                 stream_output=False,
             )
             time.sleep(1.5)
@@ -201,7 +269,7 @@ class SshClient:
                 f'docker inspect -f "{{{{.State.Running}}}}" "{name}" 2>/dev/null '
                 f'|| echo false',
                 log=None,
-                timeout=30,
+                timeout=20,
                 stream_output=False,
             )
             vlines = (verify.stdout or "").strip().splitlines()
@@ -212,11 +280,13 @@ class SshClient:
             err = self.exec_host(
                 f'docker inspect -f "{{{{.State.Error}}}}" "{name}" 2>/dev/null || true',
                 log=None,
-                timeout=30,
+                timeout=20,
                 stream_output=False,
             )
             last_err = (err.stdout or start.combined or "").strip()
             _log(f"启动尝试 {attempt}/{retries} 未成功: {last_err[:200]}")
+            if "jtop.sock" in last_err.lower() or "not a directory" in last_err.lower():
+                self._fix_jtop_sock(log=log, wait_seconds=10)
             time.sleep(2)
         raise RuntimeError(f"无法启动容器 {name}: {last_err[:300]}")
 
@@ -513,11 +583,14 @@ class SshClient:
         progress: ProgressFn | None = None,
         on_begin: Callable[[str, int], None] | None = None,
         on_end: Callable[[bool], None] | None = None,
+        *,
+        prefer_raw_tcp: bool = True,
+        skip_if_same_size: bool = True,
     ) -> ExecResult:
         """上传本地文件到域控。
 
-        优先 rsync，其次 scp（远快于 Paramiko SFTP）；都不可用时回退 SFTP。
-        进度通过 progress 回调上报（供 UI 弹窗），不写入日志栏。
+        大文件默认优先局域网明文 TCP（绕过 SSH 加解密，通常可达 80–110MB/s@千兆），
+        失败再回退 rsync / scp / SFTP。
         """
         import os
         import shutil
@@ -535,6 +608,7 @@ class SshClient:
             f'test -d "{remote_path}" && echo ISDIR || true',
             log=None,
             timeout=30,
+            stream_output=False,
         )
         if "ISDIR" in probe.combined:
             remote_path = remote_path.rstrip("/") + "/" + local.name
@@ -543,6 +617,29 @@ class SshClient:
         self.exec_host(f'mkdir -p "{parent}" 2>/dev/null || true', log=None, timeout=30)
 
         total = local.stat().st_size
+
+        if skip_if_same_size:
+            sz = self.exec_host(
+                f'stat -c%s "{remote_path}" 2>/dev/null || echo MISSING',
+                log=None,
+                timeout=30,
+                stream_output=False,
+            )
+            remote_sz = (sz.stdout or "").strip().splitlines()
+            remote_sz_s = remote_sz[-1] if remote_sz else ""
+            if remote_sz_s.isdigit() and int(remote_sz_s) == total:
+                if log:
+                    log(
+                        f"远端已存在同名同大小文件（{total / (1024**3):.2f} GB），跳过上传"
+                    )
+                if on_begin:
+                    on_begin(local.name, total)
+                if progress:
+                    progress(100, total, total, "")
+                if on_end:
+                    on_end(True)
+                return ExecResult(0, f"skip existing same-size -> {remote_path}", "")
+
         tmp = f"/tmp/k15_xfer_{int(time.time() * 1000)}_{local.name}"
         dest_candidates = [remote_path, tmp]
         use_password = bool(self.password) and not self.key_filename
@@ -572,6 +669,36 @@ class SshClient:
 
         ok = False
         try:
+            # —— 0) 局域网明文 TCP（大文件优先）——
+            # SSH/rsync 受加密与窗口限制，常卡在 ~15–25MB/s；明文 TCP 可接近链路带宽。
+            if prefer_raw_tcp and total >= 64 * 1024 * 1024:
+                if log:
+                    log("尝试局域网高速通道（明文 TCP，绕过 SSH 加密）…")
+                t0 = time.time()
+                raw = self._upload_via_raw_tcp(
+                    str(local),
+                    remote_path,
+                    total_size=total,
+                    log=log,
+                    progress=progress,
+                )
+                if raw.ok:
+                    elapsed = max(time.time() - t0, 1e-3)
+                    mbps = (total / (1024 * 1024)) / elapsed
+                    if log:
+                        log(f"上传完成（LAN-TCP，平均 {mbps:.1f} MB/s）")
+                    ok = True
+                    return ExecResult(
+                        0,
+                        f"uploaded via lan-tcp -> {remote_path} ({mbps:.1f}MB/s)",
+                        "",
+                    )
+                if log:
+                    log(
+                        f"高速通道失败，回退 rsync… "
+                        f"({(raw.stderr or raw.stdout)[:180]})"
+                    )
+
             # —— 1) rsync ——
             # 大压缩包整文件上传：必须 -W/--whole-file，否则 LAN 上仍跑 delta
             # 校验，吞吐常被压到 ~20MB/s；关压缩避免二次 gzip。
@@ -712,6 +839,534 @@ class SshClient:
         finally:
             if on_end:
                 on_end(ok)
+
+    def _upload_via_raw_tcp(
+        self,
+        local_path: str,
+        remote_path: str,
+        *,
+        total_size: int,
+        log: LogFn | None = None,
+        progress: ProgressFn | None = None,
+        port: int | None = None,
+    ) -> ExecResult:
+        """经临时 TCP 端口明文推送文件（仅适合可信局域网）。
+
+        远端用 python3 监听；本机 socket 发送。不走 SSH 加密，吞吐通常远高于 rsync/scp。
+        """
+        import os
+        import random
+        import shlex
+        import shutil
+        import socket
+        import subprocess
+        import time as time_mod
+
+        if not shutil.which("ssh"):
+            return ExecResult(127, "", "ssh not found")
+
+        listen_port = int(port or random.randint(42000, 42999))
+        partial = remote_path + ".partial"
+        parent = os.path.dirname(remote_path) or "/"
+        self.exec_host(f'mkdir -p "{parent}" 2>/dev/null || true', log=None, timeout=30)
+
+        # 远端接收脚本：打印 LISTEN_READY 后再 accept，避免抢连
+        remote_py = (
+            "import socket,sys\n"
+            "port=int(sys.argv[1]); path=sys.argv[2]\n"
+            "s=socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+            "try:\n"
+            "  s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16*1024*1024)\n"
+            "except Exception:\n"
+            "  pass\n"
+            "s.bind(('0.0.0.0', port))\n"
+            "s.listen(1)\n"
+            "s.settimeout(120)\n"
+            "print('LISTEN_READY', flush=True)\n"
+            "c, _ = s.accept()\n"
+            "try:\n"
+            "  c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16*1024*1024)\n"
+            "except Exception:\n"
+            "  pass\n"
+            "n=0\n"
+            "with open(path, 'wb') as f:\n"
+            "  while True:\n"
+            "    d=c.recv(8*1024*1024)\n"
+            "    if not d: break\n"
+            "    f.write(d); n+=len(d)\n"
+            "c.close(); s.close()\n"
+            "print('RECV_DONE', n, flush=True)\n"
+        )
+        remote_cmd = (
+            f"rm -f {shlex.quote(partial)}; "
+            f"python3 -u -c {shlex.quote(remote_py)} {listen_port} {shlex.quote(partial)}"
+        )
+
+        ssh_cmd = ["ssh", *self._ssh_cli_opts(for_scp=False), f"{self.user}@{self.host}", remote_cmd]
+        env = os.environ.copy()
+        if self.password and not self.key_filename:
+            if not shutil.which("sshpass"):
+                return ExecResult(127, "", "sshpass not found")
+            env["SSHPASS"] = self.password
+            ssh_cmd = ["sshpass", "-e", *ssh_cmd]
+
+        try:
+            listener = subprocess.Popen(
+                ssh_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                bufsize=0,
+            )
+        except FileNotFoundError as exc:
+            return ExecResult(127, "", str(exc))
+
+        assert listener.stdout is not None
+        # 等待 LISTEN_READY
+        ready = False
+        out_head = b""
+        deadline = time_mod.time() + 30
+        while time_mod.time() < deadline:
+            if listener.poll() is not None and b"LISTEN_READY" not in out_head:
+                rest = listener.stdout.read() or b""
+                text = (out_head + rest).decode("utf-8", errors="replace")
+                return ExecResult(1, text, "remote listener exited before ready")
+            line = listener.stdout.readline()
+            if not line:
+                time_mod.sleep(0.05)
+                continue
+            out_head += line
+            if b"LISTEN_READY" in line or b"LISTEN_READY" in out_head:
+                ready = True
+                break
+        if not ready:
+            listener.kill()
+            try:
+                listener.wait(timeout=5)
+            except Exception:
+                pass
+            return ExecResult(
+                1, out_head.decode("utf-8", errors="replace"), "listener not ready"
+            )
+
+        sock: socket.socket | None = None
+        try:
+            sock = socket.create_connection((self.host, listen_port), timeout=20)
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16 * 1024 * 1024)
+            except Exception:
+                pass
+
+            sent = 0
+            last_pct = -1
+            t_last = time_mod.time()
+            bytes_last = 0
+            with open(local_path, "rb") as f:
+                while True:
+                    data = f.read(8 * 1024 * 1024)
+                    if not data:
+                        break
+                    sock.sendall(data)
+                    sent += len(data)
+                    if progress and total_size > 0:
+                        pct = int(sent * 100 / total_size)
+                        now = time_mod.time()
+                        if pct != last_pct and (pct == 100 or pct >= last_pct + 1 or now - t_last >= 0.5):
+                            dt = max(now - t_last, 1e-3)
+                            speed = (sent - bytes_last) / dt
+                            # MB/s text
+                            speed_txt = f"{speed / (1024 * 1024):.2f}MB/s"
+                            last_pct = pct
+                            t_last = now
+                            bytes_last = sent
+                            progress(pct, sent, total_size, speed_txt)
+            try:
+                sock.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
+        except Exception as exc:  # noqa: BLE001
+            try:
+                listener.kill()
+            except Exception:
+                pass
+            return ExecResult(1, "", f"send failed: {exc}")
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+        # 等远端写完
+        out = out_head
+        try:
+            more = listener.communicate(timeout=600)[0] or b""
+            out += more
+        except subprocess.TimeoutExpired:
+            listener.kill()
+            return ExecResult(124, out.decode("utf-8", errors="replace"), "recv timeout")
+
+        text = out.decode("utf-8", errors="replace")
+        if listener.returncode != 0 and "RECV_DONE" not in text:
+            return ExecResult(listener.returncode or 1, text, "remote recv failed")
+
+        # 校验大小并落到最终路径
+        verify = self.exec_host(
+            f'sz=$(stat -c%s "{partial}" 2>/dev/null || echo 0); '
+            f'echo SIZE=$sz; '
+            f'if [ "$sz" = "{total_size}" ]; then '
+            f'mv -f "{partial}" "{remote_path}" && chmod 644 "{remote_path}" && echo PLACE_OK; '
+            f'else echo SIZE_MISMATCH; rm -f "{partial}"; exit 1; fi',
+            log=None,
+            timeout=600,
+            stream_output=False,
+        )
+        if "PLACE_OK" not in verify.combined:
+            # 权限不足时提权放置
+            if "SIZE_MISMATCH" in verify.combined or verify.exit_code != 0:
+                # 若只是 mv 权限问题且 size 正确
+                if f"SIZE={total_size}" in verify.combined or "SIZE_MISMATCH" not in verify.combined:
+                    placed = self.exec_host(
+                        self._sudo_cmd(
+                            f'mv -f "{partial}" "{remote_path}" && chmod 644 "{remote_path}"'
+                        )
+                        + " && echo PLACE_OK",
+                        log=None,
+                        timeout=600,
+                        stream_output=False,
+                    )
+                    if "PLACE_OK" in placed.combined:
+                        if progress and total_size > 0:
+                            progress(100, total_size, total_size, "")
+                        return ExecResult(0, f"lan-tcp -> {remote_path}", "")
+                return ExecResult(1, verify.combined, "size mismatch or place failed")
+        if progress and total_size > 0:
+            progress(100, total_size, total_size, "")
+        return ExecResult(0, f"lan-tcp -> {remote_path}", text)
+
+    def download_remote_file(
+        self,
+        remote_path: str,
+        local_path: str,
+        log: LogFn | None = None,
+        progress: ProgressFn | None = None,
+        on_begin: Callable[[str, int], None] | None = None,
+        on_end: Callable[[bool], None] | None = None,
+    ) -> ExecResult:
+        """从域控下载文件到本机。优先 rsync，其次 scp，最后 SFTP。"""
+        import shutil
+        import time
+        from pathlib import Path
+
+        remote_path = (remote_path or "").strip()
+        if not remote_path:
+            raise ValueError("远端路径为空")
+
+        probe = self.exec_host(
+            f'p="{remote_path}"; '
+            f'if [ -f "$p" ]; then echo ISFILE; '
+            f'elif [ -d "$p" ]; then echo ISDIR; '
+            f'else echo MISSING; fi',
+            log=None,
+            timeout=30,
+            stream_output=False,
+        )
+        kind = (probe.stdout or "").strip().splitlines()
+        kind_s = (kind[-1] if kind else "").strip()
+        if kind_s == "ISDIR":
+            raise IsADirectoryError(f"远端是目录，不能直接下载: {remote_path}")
+        if kind_s != "ISFILE":
+            raise FileNotFoundError(f"远端文件不存在: {remote_path}")
+
+        size_res = self.exec_host(
+            f'stat -c%s "{remote_path}" 2>/dev/null || echo 0',
+            log=None,
+            timeout=30,
+            stream_output=False,
+        )
+        try:
+            total = int((size_res.stdout or "0").strip().splitlines()[-1])
+        except ValueError:
+            total = 0
+
+        local = Path(local_path)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        use_password = bool(self.password) and not self.key_filename
+        remote_spec = f"{self.user}@{self.host}:{remote_path}"
+        name = local.name
+        ok = False
+
+        if on_begin:
+            on_begin(name, total)
+
+        try:
+            if shutil.which("rsync") and (shutil.which("sshpass") or not use_password):
+                ssh_e = "ssh " + " ".join(self._ssh_cli_opts(for_scp=False))
+                argv = [
+                    "rsync",
+                    "-a",
+                    "-W",
+                    "--whole-file",
+                    "--inplace",
+                    "--partial",
+                    "--info=progress2",
+                    "-e",
+                    ssh_e,
+                    remote_spec,
+                    str(local),
+                ]
+                if log:
+                    log("使用 rsync 下载…")
+                t0 = time.time()
+                res = self._run_cli_transfer(
+                    argv,
+                    use_password=use_password,
+                    log=log,
+                    total_size=total,
+                    timeout=6 * 3600,
+                    progress=progress,
+                )
+                if res.ok:
+                    elapsed = max(time.time() - t0, 1e-3)
+                    mbps = (total / (1024 * 1024)) / elapsed if total else 0.0
+                    if log:
+                        log(f"下载完成（rsync，平均 {mbps:.1f} MB/s）")
+                    ok = True
+                    return ExecResult(0, f"downloaded via rsync -> {local} ({mbps:.1f}MB/s)", "")
+                if log:
+                    log(f"rsync 下载失败，尝试 scp… ({(res.stderr or res.stdout)[:200]})")
+
+            if shutil.which("scp") and (shutil.which("sshpass") or not use_password):
+                argv = [
+                    "scp",
+                    "-q",
+                    *self._ssh_cli_opts(for_scp=True),
+                    remote_spec,
+                    str(local),
+                ]
+                if log:
+                    log("正在通过 scp 下载…")
+                t0 = time.time()
+                res = self._run_cli_transfer(
+                    argv,
+                    use_password=use_password,
+                    log=None,
+                    total_size=total,
+                    timeout=6 * 3600,
+                    progress=progress,
+                )
+                if res.ok:
+                    if progress and total > 0:
+                        progress(100, total, total, "")
+                    elapsed = max(time.time() - t0, 1e-3)
+                    mbps = (total / (1024 * 1024)) / elapsed if total else 0.0
+                    if log:
+                        log(f"下载完成（scp，平均 {mbps:.1f} MB/s）")
+                    ok = True
+                    return ExecResult(0, f"downloaded via scp -> {local} ({mbps:.1f}MB/s)", "")
+
+            if log:
+                log("rsync/scp 不可用，回退 SFTP 下载…")
+            client = self.ensure()
+            last_pct = [-1]
+
+            def _progress(transferred: int, _total: int) -> None:
+                if total <= 0:
+                    return
+                pct = int(transferred * 100 / total)
+                if pct != last_pct[0] and (pct == 100 or pct >= last_pct[0] + 1):
+                    last_pct[0] = pct
+                    if progress:
+                        progress(pct, transferred, total, "")
+
+            sftp = client.open_sftp()
+            try:
+                try:
+                    sftp.get_channel().settimeout(None)  # type: ignore[union-attr]
+                except Exception:
+                    pass
+                sftp.get(remote_path, str(local), callback=_progress)
+            finally:
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+            ok = True
+            if log:
+                log(f"下载完成: {local}")
+            return ExecResult(0, f"downloaded via sftp -> {local}", "")
+        except Exception as exc:  # noqa: BLE001
+            try:
+                if local.exists() and local.stat().st_size == 0:
+                    local.unlink()
+            except Exception:
+                pass
+            return ExecResult(1, "", str(exc))
+        finally:
+            if on_end:
+                on_end(ok)
+
+    def download_remote_dir(
+        self,
+        remote_path: str,
+        local_dir: str,
+        log: LogFn | None = None,
+        progress: ProgressFn | None = None,
+        on_begin: Callable[[str, int], None] | None = None,
+        on_end: Callable[[bool], None] | None = None,
+    ) -> ExecResult:
+        """递归下载远端目录到本机 local_dir（含其下全部内容）。优先 rsync，其次 scp -r。"""
+        import shutil
+        import time
+        from pathlib import Path
+
+        remote_path = (remote_path or "").strip().rstrip("/")
+        if not remote_path:
+            raise ValueError("远端路径为空")
+
+        probe = self.exec_host(
+            # 注意：不可写成 test -d && echo A || test -f && echo B
+            # bash 中 &&/|| 同优先级左结合，目录会同时打出 ISDIR 与 ISFILE
+            f'p="{remote_path}"; '
+            f'if [ -d "$p" ]; then echo ISDIR; '
+            f'elif [ -f "$p" ]; then echo ISFILE; '
+            f'else echo MISSING; fi',
+            log=None,
+            timeout=30,
+            stream_output=False,
+        )
+        kind = (probe.stdout or "").strip().splitlines()
+        kind_s = (kind[-1] if kind else "").strip()
+        if kind_s == "ISFILE":
+            raise NotADirectoryError(f"远端是文件，请用单文件下载: {remote_path}")
+        if kind_s != "ISDIR":
+            raise FileNotFoundError(f"远端目录不存在: {remote_path}")
+
+        size_res = self.exec_host(
+            f'du -sb "{remote_path}" 2>/dev/null | cut -f1 || echo 0',
+            log=None,
+            timeout=120,
+            stream_output=False,
+        )
+        try:
+            total = int((size_res.stdout or "0").strip().splitlines()[-1] or "0")
+        except ValueError:
+            total = 0
+
+        local = Path(local_dir)
+        local.mkdir(parents=True, exist_ok=True)
+        use_password = bool(self.password) and not self.key_filename
+        # 尾部 /：只同步目录内容到 local，不在 local 下再套一层同名目录
+        remote_spec = f"{self.user}@{self.host}:{remote_path}/"
+        name = local.name
+        ok = False
+
+        if on_begin:
+            on_begin(name + "/", total)
+
+        try:
+            if shutil.which("rsync") and (shutil.which("sshpass") or not use_password):
+                ssh_e = "ssh " + " ".join(self._ssh_cli_opts(for_scp=False))
+                argv = [
+                    "rsync",
+                    "-a",
+                    "-W",
+                    "--whole-file",
+                    "--partial",
+                    "--info=progress2",
+                    "-e",
+                    ssh_e,
+                    remote_spec,
+                    str(local) + "/",
+                ]
+                if log:
+                    log("使用 rsync 递归下载目录…")
+                t0 = time.time()
+                res = self._run_cli_transfer(
+                    argv,
+                    use_password=use_password,
+                    log=log,
+                    total_size=total,
+                    timeout=6 * 3600,
+                    progress=progress,
+                )
+                if res.ok:
+                    elapsed = max(time.time() - t0, 1e-3)
+                    mbps = (total / (1024 * 1024)) / elapsed if total else 0.0
+                    if log:
+                        log(f"目录下载完成（rsync，平均 {mbps:.1f} MB/s）")
+                    ok = True
+                    return ExecResult(
+                        0, f"downloaded dir via rsync -> {local} ({mbps:.1f}MB/s)", ""
+                    )
+                if log:
+                    log(f"rsync 目录下载失败，尝试 scp -r… ({(res.stderr or res.stdout)[:200]})")
+
+            if shutil.which("scp") and (shutil.which("sshpass") or not use_password):
+                # scp -r remote:dir existing_empty_dir → 会在其下再建一层 basename
+                # 因此先下到临时父目录再整理
+                tmp_parent = local.parent / f".k15_dl_{int(time.time() * 1000)}"
+                tmp_parent.mkdir(parents=True, exist_ok=True)
+                argv = [
+                    "scp",
+                    "-r",
+                    "-q",
+                    *self._ssh_cli_opts(for_scp=True),
+                    f"{self.user}@{self.host}:{remote_path}",
+                    str(tmp_parent),
+                ]
+                if log:
+                    log("正在通过 scp -r 下载目录…")
+                t0 = time.time()
+                res = self._run_cli_transfer(
+                    argv,
+                    use_password=use_password,
+                    log=None,
+                    total_size=total,
+                    timeout=6 * 3600,
+                    progress=progress,
+                )
+                if res.ok:
+                    nested = tmp_parent / Path(remote_path).name
+                    src = nested if nested.is_dir() else tmp_parent
+                    # 把内容移入目标 local
+                    import shutil as sh
+
+                    for child in src.iterdir():
+                        dest = local / child.name
+                        if dest.exists():
+                            if dest.is_dir():
+                                sh.rmtree(dest)
+                            else:
+                                dest.unlink()
+                        sh.move(str(child), str(dest))
+                    sh.rmtree(tmp_parent, ignore_errors=True)
+                    if progress and total > 0:
+                        progress(100, total, total, "")
+                    elapsed = max(time.time() - t0, 1e-3)
+                    mbps = (total / (1024 * 1024)) / elapsed if total else 0.0
+                    if log:
+                        log(f"目录下载完成（scp，平均 {mbps:.1f} MB/s）")
+                    ok = True
+                    return ExecResult(
+                        0, f"downloaded dir via scp -> {local} ({mbps:.1f}MB/s)", ""
+                    )
+                try:
+                    import shutil as sh
+
+                    sh.rmtree(tmp_parent, ignore_errors=True)
+                except Exception:
+                    pass
+
+            return ExecResult(1, "", "无法下载目录：需要本机安装 rsync 或 scp")
+        except Exception as exc:  # noqa: BLE001
+            return ExecResult(1, "", str(exc))
+        finally:
+            if on_end:
+                on_end(ok)
+
     def read_remote_file(self, remote_path: str) -> str:
         client = self.ensure()
         sftp = client.open_sftp()

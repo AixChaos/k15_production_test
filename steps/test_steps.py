@@ -44,7 +44,14 @@ def _run_remote_script(ctx: AppContext, script_body: str, script_name: str):
     w = ctx.ssh.write_remote_file(remote_host, script_body + "\n", sudo=False, log=None)
     if not w.ok:
         return ExecResult(1, "", f"写启动脚本失败: {w.combined}")
-    name = ctx.ssh.resolve_container(log=None)
+    try:
+        name = ctx.ssh.ensure_container_running(log=None)
+    except Exception as exc:  # noqa: BLE001
+        return ExecResult(
+            1,
+            "",
+            f"容器未就绪（常见于 jtop.sock 挂载异常）: {exc}",
+        )
     user = (ctx.ssh.container_user or "admin").strip() or "admin"
     cp = ctx.ssh.exec_host(
         f"docker cp {remote_host} {name}:{remote_ctr}",
@@ -53,7 +60,14 @@ def _run_remote_script(ctx: AppContext, script_body: str, script_name: str):
         stream_output=False,
     )
     if not cp.ok:
-        return ExecResult(1, "", f"拷贝启动脚本失败: {cp.combined}")
+        hint = ""
+        low = (cp.combined or "").lower()
+        if "jtop.sock" in low or "not a directory" in low:
+            hint = (
+                "；请在域控宿主机检查: ls -la /run/jtop.sock（应为 socket）。"
+                "若是目录则 sudo rm -rf /run/jtop.sock 后重启 jtop，再 docker start 容器"
+            )
+        return ExecResult(1, "", f"拷贝启动脚本失败: {cp.combined}{hint}")
     return ctx.ssh.exec_host(
         f"docker exec -u {user} {name} bash {remote_ctr}",
         log=None,
@@ -661,7 +675,15 @@ class JointLatencyTestStep(TestStep):
         env = _bridge_env(ctx)
         source = ctx.source_ws()
         local = _local_docker(ctx)
-        dc_name = ctx.ssh.resolve_container(log=None)
+        log("确保域控容器可用（检查 jtop.sock / docker start）…")
+        try:
+            dc_name = ctx.ssh.ensure_container_running(log=log)
+        except Exception as exc:  # noqa: BLE001
+            return StepResult(
+                False,
+                f"域控容器未就绪: {exc}",
+                str(exc),
+            )
         dc_user = (ctx.ssh.container_user or "admin").strip() or "admin"
         pc_name = local.container_name
         pc_user = local.container_user
@@ -963,7 +985,7 @@ class JointLatencyTestStep(TestStep):
 
 
 class RestoreTestConfigsStep(TestStep):
-    """恢复 DDS 等测试改动，停掉联调进程，保证仓库/配置纯洁。"""
+    """恢复 DDS 等测试改动，并重启两边 ros2 daemon。"""
 
     BAK_DIR_NAME = DdsBridgeStep.BAK_DIR_NAME
 
@@ -971,16 +993,36 @@ class RestoreTestConfigsStep(TestStep):
         super().__init__(
             id="test_restore_configs",
             title="恢复测试改动",
-            description="还原两边 cyclonedds 备份（进程请在关节时延步骤点「测试完成」停止）",
+            description=(
+                "还原两边 cyclonedds 备份，并在域控/本机容器内 "
+                "export RMW/CYCLONEDDS_URI 后 ros2 daemon stop/start"
+            ),
             category="test",
             dangerous=True,
         )
+
+    @staticmethod
+    def _daemon_restart_cmd(source: str) -> str:
+        return textwrap.dedent(
+            f"""
+            set +e
+            {source}
+            export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+            export CYCLONEDDS_URI=/anyverse/config/cyclonedds.xml
+            echo "RMW_IMPLEMENTATION=$RMW_IMPLEMENTATION"
+            echo "CYCLONEDDS_URI=$CYCLONEDDS_URI"
+            ros2 daemon stop
+            ros2 daemon start
+            echo DAEMON_RESTART_OK
+            """
+        ).strip()
 
     def run(self, ctx: AppContext, log: LogFn) -> StepResult:
         logs: list[str] = []
         host_work = Path(str(ctx.dc.get("host_work_dir") or "/home/nvidia/work/anyverse"))
         local_work = _local_work(ctx)
         local = _local_docker(ctx)
+        source = ctx.source_ws()
         name = ""
         try:
             name = ctx.ssh.resolve_container(log=None)
@@ -1038,8 +1080,34 @@ class RestoreTestConfigsStep(TestStep):
         except Exception as exc:  # noqa: BLE001
             return StepResult(False, f"恢复本机 DDS 失败: {exc}", "\n".join(logs))
 
-        log("DDS 配置已恢复（未执行停进程）")
-        return StepResult(True, "已恢复两边 DDS 配置", "\n".join(logs))
+        daemon_cmd = self._daemon_restart_cmd(source)
+
+        log("—— 域控容器重启 ros2 daemon ——")
+        r_dc = ctx.ssh.exec_docker(daemon_cmd, log=log, timeout=120, stream_output=True)
+        logs.append(r_dc.combined)
+        if "DAEMON_RESTART_OK" not in r_dc.combined:
+            return StepResult(
+                False,
+                f"域控 ros2 daemon 重启失败 (exit={r_dc.exit_code})",
+                "\n".join(logs),
+            )
+
+        log("—— 本机容器重启 ros2 daemon ——")
+        r_pc = local.exec(daemon_cmd, log=log, timeout=120, stream_output=True)
+        logs.append(r_pc.combined)
+        if "DAEMON_RESTART_OK" not in r_pc.combined:
+            return StepResult(
+                False,
+                f"本机 ros2 daemon 重启失败 (exit={r_pc.exit_code})",
+                "\n".join(logs),
+            )
+
+        log("DDS 配置已恢复，两边 ros2 daemon 已重启")
+        return StepResult(
+            True,
+            "已恢复两边 DDS 配置，并重启域控/本机 ros2 daemon",
+            "\n".join(logs),
+        )
 
 
 TEST_STEPS = [

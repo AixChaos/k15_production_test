@@ -177,10 +177,9 @@ class EnvPackageDeployStep(TestStep):
             id="env_package_deploy",
             title="上传部署环境压缩包",
             description=(
-                "手动选择本机 K15_env_con.tar.gz（含：密钥、anyverse-dev-pnc.tar.gz、"
-                "docker_arm_*.tar.gz、99-EtherCAT.rules）→ 上传域控 → 解压 → "
-                "安装 SSH 密钥与 GitLab known_hosts、代码到 ~/work、docker load 镜像、"
-                "安装 udev 规则并 reload/trigger"
+                "手动选择本机 K15_env_con.tar / .tar.gz（含：密钥、anyverse 目录或 "
+                "anyverse-dev-pnc*.tar.gz、docker_arm*/arm64* 镜像、99-EtherCAT.rules）→ "
+                "上传域控 → 解压 → 安装密钥、代码、docker load、udev 规则"
             ),
             category="env",
             dangerous=True,
@@ -209,7 +208,10 @@ class EnvPackageDeployStep(TestStep):
         # —— 1 上传 ——
         self._stage(log, 1, "上传环境压缩包到域控")
         size_gb = local.stat().st_size / (1024**3)
-        log(f"文件: {local.name}（约 {size_gb:.1f} GB），上传中请耐心等待")
+        log(
+            f"文件: {local.name}（约 {size_gb:.1f} GB）。"
+            "大文件优先走局域网高速通道（明文 TCP），失败再回退 rsync"
+        )
         try:
             up = ctx.ssh.upload_local_file(
                 str(local),
@@ -218,6 +220,8 @@ class EnvPackageDeployStep(TestStep):
                 progress=ctx.on_upload_progress,
                 on_begin=ctx.on_upload_begin,
                 on_end=ctx.on_upload_end,
+                prefer_raw_tcp=True,
+                skip_if_same_size=True,
             )
         except Exception as exc:  # noqa: BLE001
             return StepResult(False, f"上传失败: {exc}", str(exc))
@@ -228,12 +232,24 @@ class EnvPackageDeployStep(TestStep):
         # —— 2 解压外层包 ——
         self._stage(log, 2, "在域控解压环境压缩包")
         log("正在解压（大文件可能需要数分钟）…")
+        # 支持 .tar.gz/.tgz（gzip）与 .tar（未再压缩，上传更快：避免二次 gzip 镜像）
+        name_l = local.name.lower()
+        if name_l.endswith(".tar.gz") or name_l.endswith(".tgz"):
+            tar_flag = "-xzf"
+        elif name_l.endswith(".tar"):
+            tar_flag = "-xf"
+        else:
+            return StepResult(
+                False,
+                f"不支持的压缩包格式: {local.name}（请使用 .tar.gz / .tgz / .tar）",
+                "",
+            )
         extract_cmd = textwrap.dedent(
             f"""
             set -e
             rm -rf "{extract_dir}"
             mkdir -p "{extract_dir}"
-            tar -xzf "{remote_archive}" -C "{extract_dir}"
+            tar {tar_flag} "{remote_archive}" -C "{extract_dir}"
             echo OK
             """
         ).strip()
@@ -311,22 +327,37 @@ class EnvPackageDeployStep(TestStep):
                 msg += "，编译时可能出现 SSH 确认提示"
             log(msg)
 
-        # —— 4 解压代码包 ——
+        # —— 4 解压/同步代码到 work 目录 ——
         self._stage(log, 4, "解压代码包到 work 目录")
-        log("正在解压 anyverse-dev-pnc…")
+        log("正在部署 anyverse 代码（tar.gz 或目录）…")
         code_cmd = textwrap.dedent(
             f"""
             set -e
+            mkdir -p "{work_dir}"
             CODE_TGZ=$(find "{extract_dir}" -maxdepth 2 -type f -name 'anyverse-dev-pnc*.tar.gz' | head -1)
             if [ -z "$CODE_TGZ" ]; then
               CODE_TGZ=$(find "{extract_dir}" -maxdepth 2 -type f -name 'anyverse*.tar.gz' ! -name 'docker*' | head -1)
             fi
-            if [ -z "$CODE_TGZ" ]; then
-              echo "ERROR: 未找到 anyverse-dev-pnc.tar.gz"
+            if [ -n "$CODE_TGZ" ]; then
+              echo "CODE_SRC=tgz:$CODE_TGZ"
+              tar -xzf "$CODE_TGZ" -C "{work_dir}"
+              echo OK
+              exit 0
+            fi
+            # 兼容：环境包内直接放解压后的 anyverse 目录
+            CODE_DIR=$(find "{extract_dir}" -maxdepth 2 -type d -name 'anyverse' | head -1)
+            if [ -z "$CODE_DIR" ]; then
+              CODE_DIR=$(find "{extract_dir}" -maxdepth 2 -type d -name 'anyverse-dev-pnc*' | head -1)
+            fi
+            if [ -z "$CODE_DIR" ]; then
+              echo "ERROR: 未找到 anyverse-dev-pnc.tar.gz 或 anyverse 目录"
               exit 1
             fi
+            echo "CODE_SRC=dir:$CODE_DIR"
+            DEST="{work_dir}/anyverse"
+            rm -rf "$DEST"
             mkdir -p "{work_dir}"
-            tar -xzf "$CODE_TGZ" -C "{work_dir}"
+            cp -a "$CODE_DIR" "$DEST"
             echo OK
             """
         ).strip()
@@ -351,17 +382,21 @@ class EnvPackageDeployStep(TestStep):
             f"""
             set -e
             {sudo_fn}
-            IMG=$(find "{extract_dir}" -maxdepth 2 -type f \\( -name 'docker_arm*.tar.gz' -o -name 'docker_arm*.tar' -o -name 'docker*.tar.gz' \\) | head -1)
+            IMG=$(find "{extract_dir}" -maxdepth 2 -type f \\( \
+              -name 'docker_arm*.tar.gz' -o -name 'docker_arm*.tar' -o \
+              -name 'docker*.tar.gz' -o -name 'docker*.tar' -o \
+              -name 'arm64*.tar.gz' -o -name 'arm64*.tar' \\) | head -1)
             if [ -z "$IMG" ]; then
-              IMG_DIR=$(find "{extract_dir}" -maxdepth 2 -type d -name 'docker_arm*' | head -1)
+              IMG_DIR=$(find "{extract_dir}" -maxdepth 2 -type d \\( -name 'docker_arm*' -o -name 'docker*' \\) | head -1)
               if [ -n "$IMG_DIR" ]; then
                 IMG=$(find "$IMG_DIR" -maxdepth 2 -type f \\( -name '*.tar.gz' -o -name '*.tar' \\) | head -1)
               fi
             fi
             if [ -z "$IMG" ]; then
-              echo "ERROR: 未找到 docker_arm 镜像压缩包"
+              echo "ERROR: 未找到 Docker 镜像包（支持 docker_arm* / docker* / arm64* 的 .tar.gz/.tar）"
               exit 1
             fi
+            echo "IMG=$IMG"
             do_load() {{
               local img="$1"
               if docker load -i "$img" >/tmp/k15_docker_load.out 2>/tmp/k15_docker_load.err; then
@@ -452,8 +487,9 @@ class CameraInitStep(TestStep):
             id="env_camera_init",
             title="相机初始化配置",
             description=(
-                "若 agent_dev_nvidia 在运行则先 docker stop → "
-                "anyverse_config_init.sh → docker_run.sh 选 2 并确认 y 重建启动容器"
+                "若已有 <robot>_camera.json 则跳过；"
+                "否则 stop 容器 →（无 ethercat 配置时）anyverse_config_init.sh → "
+                "docker_run.sh 选 2+y 重建启动"
             ),
             category="env",
             dangerous=True,
@@ -464,6 +500,68 @@ class CameraInitStep(TestStep):
         cname = "agent_dev_nvidia"
         logs: list[str] = []
 
+        # robot_name 与后续 Camera SN 一致：用 hostname
+        log("检查相机配置是否已存在…")
+        probe = ctx.ssh.exec_host(
+            'robot_name=$(hostname); '
+            'f="/etc/anyverse_config/device/${robot_name}_camera.json"; '
+            'echo "robot_name=$robot_name"; '
+            'echo "file=$f"; '
+            'if [ -f "$f" ]; then echo CAMERA_CFG_EXISTS; else echo CAMERA_CFG_MISSING; fi',
+            log=log,
+            timeout=60,
+            stream_output=False,
+        )
+        logs.append(probe.combined)
+        if "CAMERA_CFG_EXISTS" in probe.combined:
+            robot = ""
+            for line in probe.combined.splitlines():
+                if line.startswith("robot_name="):
+                    robot = line.split("=", 1)[1].strip()
+                    break
+            log(
+                f"已存在相机配置 "
+                f"/etc/anyverse_config/device/{robot or '<robot_name>'}_camera.json，"
+                "跳过初始化"
+            )
+            # 后续步骤依赖容器：若未运行则尝试 start（不做重建）
+            check = ctx.ssh.exec_host(
+                f'docker inspect -f "{{{{.State.Running}}}}" "{cname}" 2>/dev/null '
+                f'|| echo missing',
+                log=None,
+                timeout=60,
+                stream_output=False,
+            )
+            state = (check.stdout or "").strip().splitlines()
+            state_line = (state[-1] if state else "").strip().lower()
+            if state_line == "true":
+                log(f"容器 {cname} 已在运行")
+            elif state_line == "false":
+                log(f"容器 {cname} 未运行，尝试 docker start…")
+                start = ctx.ssh.exec_host(
+                    f'docker start "{cname}"',
+                    log=log,
+                    timeout=180,
+                    stream_output=True,
+                )
+                logs.append(start.combined)
+                if not start.ok:
+                    return StepResult(
+                        False,
+                        f"配置已存在，但启动容器 {cname} 失败",
+                        "\n".join(logs),
+                    )
+            else:
+                log(f"提示: 容器 {cname} 不存在，后续步骤前请先完成容器部署")
+            ctx.dc["container_name"] = cname
+            ctx.ssh.container_name = cname
+            return StepResult(
+                True,
+                f"相机配置已存在（robot_name={robot or 'unknown'}），跳过初始化",
+                "\n".join(logs),
+            )
+
+        log("未找到相机配置文件，开始初始化…")
         log(f"检查容器是否在运行: {cname}")
         # 注意：勿用含 RUNNING 的 NOT_RUNNING 再做子串判断（"RUNNING" in "NOT_RUNNING" 恒为真）
         check = ctx.ssh.exec_host(
@@ -496,16 +594,38 @@ class CameraInitStep(TestStep):
         else:
             # false=已存在但未运行；missing=不存在 —— 都无需 stop
             log(f"容器 {cname} 未在运行（{state_line or 'unknown'}），跳过停止")
-        log("执行 anyverse_config_init.sh …")
-        cmd = f'cd "{work}" && sudo ./script/anyverse_config_init.sh'
-        res = ctx.ssh.exec_host(cmd, log=log, timeout=600, stream_output=True)
-        logs.append(res.combined)
-        if not res.ok:
-            return StepResult(
-                False,
-                f"相机初始化失败 (exit={res.exit_code})",
-                "\n".join(logs),
+
+        # anyverse_config_init.sh 只创建目录 + *_ethercat.json；
+        # 若 ethercat 已存在会交互询问 Overwrite，必须非交互回答，否则会卡住。
+        eth_probe = ctx.ssh.exec_host(
+            'robot_name=$(tr -d "[:space:]" </etc/hostname); '
+            'f="/etc/anyverse_config/device/${robot_name}_ethercat.json"; '
+            'echo "ethercat_file=$f"; '
+            'if [ -f "$f" ]; then echo ETHERCAT_CFG_EXISTS; else echo ETHERCAT_CFG_MISSING; fi',
+            log=None,
+            timeout=60,
+            stream_output=False,
+        )
+        logs.append(eth_probe.combined)
+        if "ETHERCAT_CFG_EXISTS" in eth_probe.combined:
+            log("ethercat 配置已存在，跳过 anyverse_config_init.sh（避免 Overwrite 交互卡住）")
+        else:
+            log("执行 anyverse_config_init.sh（非交互，已有文件则保留）…")
+            # 即使竞态下文件已出现，回答 n 保留现有配置
+            cmd = (
+                f'cd "{work}" && '
+                f'printf "n\\n" | sudo ./script/anyverse_config_init.sh'
             )
+            res = ctx.ssh.exec_host(
+                cmd, log=log, timeout=600, stream_output=True, get_pty=True
+            )
+            logs.append(res.combined)
+            if not res.ok:
+                return StepResult(
+                    False,
+                    f"相机初始化失败 (exit={res.exit_code})",
+                    "\n".join(logs),
+                )
 
         # docker_run.sh 交互：先选 2 重建，再输入 y 确认删除
         log("执行 docker_run.sh（选 2 重建并输入 y 确认）…")

@@ -81,17 +81,21 @@ class UploadProgressDialog(QDialog):
             QDialog {
                 background: #1a1d23;
                 color: #e8eaed;
+                font-family: "冬青黑體簡體中文";
             }
             QLabel#uploadTitle {
+                font-family: "冬青黑體簡體中文";
                 font-size: 16px;
                 font-weight: 700;
                 color: #f0f3f6;
             }
             QLabel#uploadFile {
+                font-family: "冬青黑體簡體中文";
                 color: #c5c8c6;
                 font-size: 13px;
             }
             QLabel#uploadDetail {
+                font-family: "冬青黑體簡體中文";
                 color: #9aa0a6;
                 font-size: 12px;
             }
@@ -102,6 +106,7 @@ class UploadProgressDialog(QDialog):
                 background: #0f1115;
                 height: 22px;
                 color: #e8eaed;
+                font-family: "冬青黑體簡體中文";
                 font-weight: 600;
             }
             QProgressBar::chunk {
@@ -139,14 +144,21 @@ class UploadProgressDialog(QDialog):
         layout.addWidget(self.detail_label)
 
         self._total = 0
+        self._mode = "upload"
 
-    def start(self, filename: str, total_bytes: int) -> None:
+    def start(self, filename: str, total_bytes: int, *, mode: str = "upload") -> None:
+        self._mode = "download" if mode == "download" else "upload"
         self._total = max(0, total_bytes)
         self.file_label.setText(filename)
         self.bar.setValue(0)
         size_txt = _fmt_bytes(self._total) if self._total else "未知大小"
         self.detail_label.setText(f"总大小 {size_txt} · 正在建立传输…")
-        self.title_label.setText("正在上传到域控")
+        if self._mode == "download":
+            self.setWindowTitle("文件下载")
+            self.title_label.setText("正在从域控下载")
+        else:
+            self.setWindowTitle("文件上传")
+            self.title_label.setText("正在上传到域控")
         self.show()
         self.raise_()
         self.activateWindow()
@@ -174,8 +186,12 @@ class UploadProgressDialog(QDialog):
     def finish(self, ok: bool = True) -> None:
         if ok:
             self.bar.setValue(100)
-            self.title_label.setText("上传完成")
-            self.detail_label.setText("文件已传输到域控")
+            if self._mode == "download":
+                self.title_label.setText("下载完成")
+                self.detail_label.setText("文件已保存到本机")
+            else:
+                self.title_label.setText("上传完成")
+                self.detail_label.setText("文件已传输到域控")
         else:
-            self.title_label.setText("上传失败")
+            self.title_label.setText("下载失败" if self._mode == "download" else "上传失败")
         self.accept()

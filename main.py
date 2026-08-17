@@ -13,11 +13,14 @@ if str(ROOT) not in sys.path:
 def main() -> int:
     from PySide6.QtWidgets import QApplication
 
+    from ui.fonts import apply_app_font, load_app_font
     from ui.main_window import MainWindow
 
     app = QApplication(sys.argv)
     app.setApplicationName("K15ProductionTest")
     app.setOrganizationName("Anyverse")
+    family = load_app_font()
+    apply_app_font(app, family=family, point_size=11)
     win = MainWindow()
     win.show()
     return app.exec()

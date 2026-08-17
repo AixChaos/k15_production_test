@@ -28,15 +28,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.config import ROOT, load_config, save_config
+from core.config import ROOT, config_path, load_config, report_dir, save_config
 from core.context import AppContext, write_report
 from core.netinfo import get_wired_ipv4
 from core.ssh_client import SshClient
 from steps import all_steps, steps_by_category
 from steps.base import StepResult, StepStatus, TestStep
-from ui.remote_path_dialog import RemotePathDialog
+from ui.remote_download_dialog import RemoteDownloadDialog
 from ui.end_effector_dialog import EndEffectorChoiceDialog
 from ui.styles import APP_QSS, STATUS_COLORS
+from ui.fonts import APP_FONT_FAMILY
 from ui.upload_progress_dialog import UploadProgressDialog
 
 
@@ -96,7 +97,6 @@ class MainWindow(QMainWindow):
         self.ssh: Optional[SshClient] = None
         self.worker: Optional[StepWorker] = None
         self._busy = False
-        self._local_file: str = ""
         self._upload_dlg: Optional[UploadProgressDialog] = None
 
         self._build_ui()
@@ -133,8 +133,7 @@ class MainWindow(QMainWindow):
         self.btn_connect.clicked.connect(self.on_connect)
         self.btn_disconnect.clicked.connect(self.on_disconnect)
         self.btn_save_cfg.clicked.connect(self.on_save_config)
-        self.btn_pick_local.clicked.connect(self.on_pick_local_file)
-        self.btn_xfer.clicked.connect(self.on_transfer_file)
+        self.btn_download.clicked.connect(self.on_download_from_dc)
         self.host_edit.lineEdit().editingFinished.connect(self.on_host_editing_finished)
         self.btn_run.clicked.connect(self.on_run_step)
         self.btn_manual.clicked.connect(self.on_manual_pass)
@@ -205,25 +204,19 @@ class MainWindow(QMainWindow):
         btn_row.addStretch()
         form.addRow(btn_row)
 
-        # —— 文件传输 ——
-        form.addRow(QLabel("<b>文件传输</b>（本机 → 域控）"))
-        self.local_file_edit = QLineEdit()
-        self.local_file_edit.setReadOnly(True)
-        self.local_file_edit.setPlaceholderText("尚未选择本地文件")
-        xfer_row1 = QHBoxLayout()
-        self.btn_pick_local = QPushButton("1. 选择本地文件")
-        xfer_row1.addWidget(self.local_file_edit, 1)
-        xfer_row1.addWidget(self.btn_pick_local)
-        form.addRow("本地文件", xfer_row1)
-
-        self.remote_path_edit = QLineEdit()
-        self.remote_path_edit.setPlaceholderText("域控目标路径（按钮 2 可浏览选择并自动传输）")
-        xfer_row2 = QHBoxLayout()
-        self.btn_xfer = QPushButton("2. 选择域控路径并传输")
-        self.btn_xfer.setObjectName("success")
-        xfer_row2.addWidget(self.remote_path_edit, 1)
-        xfer_row2.addWidget(self.btn_xfer)
-        form.addRow("域控路径", xfer_row2)
+        # —— 文件下载 ——
+        form.addRow(QLabel("<b>文件下载</b>（域控 → 本机）"))
+        dl_row = QHBoxLayout()
+        self.btn_download = QPushButton("浏览域控并下载到本机")
+        self.btn_download.setObjectName("success")
+        self.btn_download.setToolTip("打开域控目录；点击文件即下载到「下载/Downloads」")
+        dl_hint = QLabel("点击后浏览域控文件树，点选文件保存到本机下载目录")
+        dl_hint.setObjectName("hint")
+        dl_hint.setWordWrap(True)
+        dl_row.addWidget(self.btn_download)
+        dl_row.addStretch()
+        form.addRow(dl_row)
+        form.addRow(dl_hint)
 
         form_l.addWidget(conn_box)
         form_l.addStretch()
@@ -233,7 +226,7 @@ class MainWindow(QMainWindow):
         log_host = QWidget()
         log_l = QVBoxLayout(log_host)
         log_l.setContentsMargins(0, 0, 0, 0)
-        log_l.addWidget(QLabel("连接 / 传输日志"))
+        log_l.addWidget(QLabel("连接 / 下载日志"))
         self.conn_log_view = QTextEdit()
         self.conn_log_view.setReadOnly(True)
         log_l.addWidget(self.conn_log_view, 1)
@@ -592,7 +585,7 @@ class MainWindow(QMainWindow):
                 continue
             if color:
                 view.append(
-                    f'<span style="color:{color};font-family:Consolas,monospace;">'
+                    f'<span style="color:{color};font-family:\'{APP_FONT_FAMILY}\',sans-serif;">'
                     f"{html.escape(msg)}</span>"
                 )
             else:
@@ -669,13 +662,22 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "本机 IP", "未检测到有线网卡 IP")
 
     @Slot()
-    def on_pick_local_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "选择本地文件", str(Path.home()), "所有文件 (*)")
-        if not path:
+    def on_download_from_dc(self) -> None:
+        if not self.ssh or not self.ssh.connected:
+            QMessageBox.warning(self, "未连接", "请先连接域控后再下载文件")
             return
-        self._local_file = path
-        self.local_file_edit.setText(path)
-        self.append_log(f"已选择本地文件: {path}")
+        user = self.user_edit.text().strip() or "nvidia"
+        start = (
+            str(self.config.get("domain_controller", {}).get("host_work_dir", "") or "").strip()
+            or f"/home/{user}"
+        )
+        # 从 work 目录的上一级或用户家目录开始更方便浏览
+        if start.endswith("/anyverse"):
+            start = str(Path(start).parent)
+        self.append_log(f"\n======== 从域控下载文件 ========\n起始目录: {start}")
+        dlg = RemoteDownloadDialog(self.ssh, start_path=start, parent=self)
+        dlg.exec()
+        self.append_log("已关闭域控文件浏览器")
 
     @Slot(str, object)
     def on_upload_begin(self, filename: str, total: object) -> None:
@@ -693,63 +695,6 @@ class MainWindow(QMainWindow):
         if self._upload_dlg is not None:
             self._upload_dlg.finish(ok)
             self._upload_dlg = None
-
-    @Slot()
-    def on_transfer_file(self) -> None:
-        if not self._local_file or not Path(self._local_file).is_file():
-            QMessageBox.information(self, "提示", "请先点击「1. 选择本地文件」")
-            return
-        if not self.ssh or not self.ssh.connected:
-            QMessageBox.warning(self, "未连接", "请先连接域控后再传输文件")
-            return
-
-        start = self.remote_path_edit.text().strip() or f"/home/{self.user_edit.text().strip() or 'nvidia'}"
-        dlg = RemotePathDialog(self.ssh, start_path=start, parent=self)
-        # 预填本地文件名
-        dlg.file_name_edit.setText(Path(self._local_file).name)
-        if dlg.exec() != dlg.DialogCode.Accepted:
-            return
-
-        remote = dlg.selected_path()
-        self.remote_path_edit.setText(remote)
-        self.append_log(f"\n======== 文件传输 ========\n本地: {self._local_file}\n域控: {remote}")
-
-        progress_dlg = UploadProgressDialog(self)
-        from PySide6.QtWidgets import QApplication
-
-        def _begin(name: str, total: int) -> None:
-            progress_dlg.start(name, total)
-            QApplication.processEvents()
-
-        def _prog(pct: int, done: int, total: int, speed: str) -> None:
-            progress_dlg.update_progress(pct, done, total, speed)
-            QApplication.processEvents()
-
-        def _end(ok: bool) -> None:
-            progress_dlg.finish(ok)
-            QApplication.processEvents()
-
-        try:
-            res = self.ssh.upload_local_file(
-                self._local_file,
-                remote,
-                log=self.append_log,
-                progress=_prog,
-                on_begin=_begin,
-                on_end=_end,
-            )
-        except Exception as exc:  # noqa: BLE001
-            if progress_dlg.isVisible():
-                progress_dlg.finish(False)
-            QMessageBox.critical(self, "传输失败", str(exc))
-            self.append_log(f"[FAIL] 传输异常: {exc}")
-            return
-        if res.ok:
-            self.append_log(f"[PASS] 已传输到 {remote}")
-            QMessageBox.information(self, "传输成功", f"已上传到域控:\n{remote}")
-        else:
-            self.append_log(f"[FAIL] 传输失败: {res.combined}")
-            QMessageBox.critical(self, "传输失败", res.combined or "未知错误")
 
     @Slot()
     def on_host_editing_finished(self) -> None:
@@ -787,12 +732,38 @@ class MainWindow(QMainWindow):
                 container_user=dc.get("container_user", "admin") or "admin",
             )
             client.connect(log=self.append_log)
-            # 探测容器并写回配置（界面已不展示容器名）
+            # 探测容器并写回配置；连接在 UI 线程，只做快速探测，避免 jtop 等待卡死界面
             try:
                 name = client.resolve_container(log=self.append_log)
                 self.config.setdefault("domain_controller", {})["container_name"] = name
-                # 域控重启后容器常因 jtop.sock 未就绪而未起来，连接时一并拉起
-                client.ensure_container_running(log=self.append_log)
+                st = client.exec_host(
+                    f'docker inspect -f "{{{{.State.Running}}}}" "{name}" 2>/dev/null '
+                    f'|| echo missing',
+                    log=None,
+                    timeout=15,
+                    stream_output=False,
+                )
+                running = (st.stdout or "").strip().splitlines()
+                running_s = (running[-1] if running else "").strip().lower()
+                if running_s == "true":
+                    self.append_log(f"容器 {name} 已在运行")
+                elif running_s != "missing":
+                    self.append_log(f"容器 {name} 未运行，尝试 docker start…")
+                    start = client.exec_host(
+                        f'docker start "{name}"',
+                        log=None,
+                        timeout=25,
+                        stream_output=False,
+                    )
+                    if start.ok:
+                        self.append_log(f"容器 {name} 已启动")
+                    else:
+                        self.append_log(
+                            f"提示: docker start 未成功: {(start.combined or '')[:180]}；"
+                            "执行测试步骤时会自动尝试修复 jtop.sock"
+                        )
+                else:
+                    self.append_log(f"提示: 容器 {name} 不存在，请先完成环境部署")
             except Exception as exc:  # noqa: BLE001
                 self.append_log(f"提示: 容器未就绪 ({exc})，SSH 已连通，可先完成环境部署后再测")
             if self.ssh:
@@ -818,8 +789,8 @@ class MainWindow(QMainWindow):
         self._remember_host(persist=False)
         self._apply_fields_to_config()
         save_config(self.config)
-        self.append_log(f"配置已保存: {ROOT / 'config' / 'default.yaml'}")
-        QMessageBox.information(self, "保存", "配置已写入 config/default.yaml")
+        self.append_log(f"配置已保存: {config_path()}")
+        QMessageBox.information(self, "保存", f"配置已写入\n{config_path()}")
 
     def _pick_env_package(self) -> str:
         """选择本机环境压缩包；默认打开 ~/下载。"""
@@ -829,9 +800,9 @@ class MainWindow(QMainWindow):
         start = str(downloads if downloads.is_dir() else Path.home())
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "选择环境压缩包 (如 K15_env_con.tar.gz)",
+            "选择环境压缩包 (如 K15_env_con.tar / .tar.gz)",
             start,
-            "压缩包 (*.tar.gz *.tgz);;所有文件 (*)",
+            "压缩包 (*.tar *.tar.gz *.tgz);;所有文件 (*)",
         )
         return path or ""
 
@@ -974,7 +945,7 @@ class MainWindow(QMainWindow):
             }
             for s in self.steps
         ]
-        out_dir = ROOT / self.config.get("report", {}).get("output_dir", "reports")
+        out_dir = report_dir(self.config.get("report", {}).get("output_dir", "reports"))
         path = write_report(
             results,
             out_dir,

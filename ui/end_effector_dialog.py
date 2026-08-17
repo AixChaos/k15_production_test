@@ -24,12 +24,26 @@ class EndEffectorChoiceDialog(QDialog):
         self._choice: Optional[str] = None
         self.setStyleSheet(
             """
-            QDialog { background: #1a1d23; color: #e8eaed; }
-            QLabel#title { font-size: 16px; font-weight: 700; color: #f0f3f6; }
-            QLabel#hint { color: #9aa0a6; }
+            QDialog {
+                background: #1a1d23;
+                color: #e8eaed;
+                font-family: "冬青黑體簡體中文";
+            }
+            QLabel#title {
+                font-family: "冬青黑體簡體中文";
+                font-size: 16px;
+                font-weight: 700;
+                color: #f0f3f6;
+            }
+            QLabel#hint {
+                font-family: "冬青黑體簡體中文";
+                color: #9aa0a6;
+            }
             QPushButton {
                 background: #3d5a80; color: white; border: none;
-                border-radius: 5px; padding: 12px 16px; font-weight: 600;
+                border-radius: 5px; padding: 12px 16px;
+                font-family: "冬青黑體簡體中文";
+                font-weight: 600;
             }
             QPushButton:hover { background: #4a6d99; }
             QPushButton#ghost {
