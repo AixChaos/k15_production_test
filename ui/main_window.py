@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, Signal, Slot
-from PySide6.QtGui import QColor, QTextCursor
+from PySide6.QtGui import QColor, QMouseEvent, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -39,6 +39,15 @@ from ui.end_effector_dialog import EndEffectorChoiceDialog
 from ui.styles import APP_QSS, STATUS_COLORS
 from ui.fonts import APP_FONT_FAMILY
 from ui.upload_progress_dialog import UploadProgressDialog
+
+
+class LogTextEdit(QTextEdit):
+    """只读日志：鼠标松开且有选区时自动复制，无需 Ctrl+C。"""
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton and self.textCursor().hasSelection():
+            self.copy()
 
 
 class StepWorker(QThread):
@@ -227,7 +236,7 @@ class MainWindow(QMainWindow):
         log_l = QVBoxLayout(log_host)
         log_l.setContentsMargins(0, 0, 0, 0)
         log_l.addWidget(QLabel("连接 / 下载日志"))
-        self.conn_log_view = QTextEdit()
+        self.conn_log_view = LogTextEdit()
         self.conn_log_view.setReadOnly(True)
         log_l.addWidget(self.conn_log_view, 1)
         btn_clear_conn = QPushButton("清空日志")
@@ -295,7 +304,7 @@ class MainWindow(QMainWindow):
         single_page = QWidget()
         single_l = QVBoxLayout(single_page)
         single_l.setContentsMargins(0, 0, 0, 0)
-        self.log_view = QTextEdit()
+        self.log_view = LogTextEdit()
         self.log_view.setReadOnly(True)
         single_l.addWidget(self.log_view, 1)
         self.log_stack.addWidget(single_page)
@@ -308,7 +317,7 @@ class MainWindow(QMainWindow):
         self.triple_status.setObjectName("hint")
         self.triple_status.setWordWrap(True)
         triple_l.addWidget(self.triple_status)
-        self.log_channel_views: dict[str, QTextEdit] = {}
+        self.log_channel_views: dict[str, LogTextEdit] = {}
         self.log_triple_splitter = QSplitter()
         for key, title, color in (
             ("controller", "Controller（域控）", "#4fc3f7"),
@@ -322,7 +331,7 @@ class MainWindow(QMainWindow):
             hdr = QLabel(title)
             hdr.setObjectName("logPaneHeader")
             hdr.setStyleSheet(f"color: {color}; font-weight: 600;")
-            view = QTextEdit()
+            view = LogTextEdit()
             view.setReadOnly(True)
             col_l.addWidget(hdr)
             col_l.addWidget(view, 1)
