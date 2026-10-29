@@ -1,6 +1,7 @@
 """主窗口：连接域控、分步点击执行、日志与报告。"""
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -94,6 +95,9 @@ class StepWorker(QThread):
 
 
 class MainWindow(QMainWindow):
+    # 工作线程请求主线程弹出压缩包选择
+    _request_env_package = Signal()
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("K15 生产测试上位机")
@@ -107,6 +111,9 @@ class MainWindow(QMainWindow):
         self.worker: Optional[StepWorker] = None
         self._busy = False
         self._upload_dlg: Optional[UploadProgressDialog] = None
+        self._pick_pkg_event = threading.Event()
+        self._pick_pkg_path = ""
+        self._request_env_package.connect(self._on_request_env_package)
 
         self._build_ui()
         self._load_fields_from_config()
@@ -149,6 +156,7 @@ class MainWindow(QMainWindow):
         self.btn_skip.clicked.connect(self.on_skip)
         self.btn_reset.clicked.connect(self.on_reset)
         self.btn_export.clicked.connect(self.on_export)
+        self.deploy_list.currentItemChanged.connect(self.on_selection_changed)
         self.env_list.currentItemChanged.connect(self.on_selection_changed)
         self.test_list.currentItemChanged.connect(self.on_selection_changed)
         self.step_tabs.currentChanged.connect(lambda _: self.on_selection_changed())
@@ -264,8 +272,10 @@ class MainWindow(QMainWindow):
         left_l = QVBoxLayout(left)
         left_l.setContentsMargins(0, 0, 0, 0)
         self.step_tabs = QTabWidget()
+        self.deploy_list = QListWidget()
         self.env_list = QListWidget()
         self.test_list = QListWidget()
+        self.step_tabs.addTab(self.deploy_list, "一键部署")
         self.step_tabs.addTab(self.env_list, "环境配置")
         self.step_tabs.addTab(self.test_list, "生产测试")
         left_l.addWidget(self.step_tabs)
@@ -477,7 +487,12 @@ class MainWindow(QMainWindow):
         self.config["ros"].setdefault("network_interface", "eth5")
 
     def _current_list(self) -> QListWidget:
-        return self.env_list if self.step_tabs.currentIndex() == 0 else self.test_list
+        idx = self.step_tabs.currentIndex()
+        if idx == 0:
+            return self.deploy_list
+        if idx == 1:
+            return self.env_list
+        return self.test_list
 
     def _current_step(self) -> Optional[TestStep]:
         item = self._current_list().currentItem()
@@ -487,6 +502,7 @@ class MainWindow(QMainWindow):
         return self.step_map.get(sid)
 
     def _refresh_lists(self) -> None:
+        self._fill_list(self.deploy_list, steps_by_category("deploy"))
         self._fill_list(self.env_list, steps_by_category("env"))
         self._fill_list(self.test_list, steps_by_category("test"))
         self._update_progress()
@@ -637,7 +653,25 @@ class MainWindow(QMainWindow):
             dc.get("host_work_dir", "/home/nvidia/work/anyverse") or "/home/nvidia/work/anyverse"
         )
         self.ssh.container_user = str(dc.get("container_user", "admin") or "admin")
-        return AppContext(config=self.config, ssh=self.ssh, log=self.append_log)
+        ctx = AppContext(config=self.config, ssh=self.ssh, log=self.append_log)
+        ctx.request_env_package = self._request_env_package_blocking
+        return ctx
+
+    def _request_env_package_blocking(self) -> str:
+        """供工作线程调用：切回主线程弹出压缩包选择框。"""
+        self._pick_pkg_path = ""
+        self._pick_pkg_event.clear()
+        self._request_env_package.emit()
+        if not self._pick_pkg_event.wait(timeout=600):
+            return ""
+        return self._pick_pkg_path or ""
+
+    @Slot()
+    def _on_request_env_package(self) -> None:
+        try:
+            self._pick_pkg_path = self._pick_env_package()
+        finally:
+            self._pick_pkg_event.set()
 
     @Slot()
     def on_finish_joint_test(self) -> None:
@@ -843,6 +877,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "文件无效", f"所选文件不存在:\n{package_path}")
                 return
             self.append_log(f"已选择环境压缩包: {package_path}")
+        # deploy_one_click：压缩包在执行到环境步骤 2 时再弹框选择
 
         end_effector_mode = ""
         if step.id == "env_end_effector":
@@ -863,6 +898,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "未连接", str(exc))
             return
 
+        # 一键部署不在启动前预选包，步骤 2 内再弹框
         if package_path:
             ctx.local_package_path = package_path
             ctx.config.setdefault("env_package", {})["local_path"] = package_path

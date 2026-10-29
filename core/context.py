@@ -31,6 +31,8 @@ class AppContext:
     finish_event: threading.Event = field(default_factory=threading.Event)
     # 本机选择的环境压缩包路径（由 UI 在执行步骤前填入）
     local_package_path: str = ""
+    # 一键部署等：在工作线程中请求 UI 弹出压缩包选择（阻塞直到选择或取消）
+    request_env_package: Callable[[], str] | None = None
     # 上传进度（由 UI 注入，供弹窗显示）
     on_upload_begin: UploadBeginFn | None = None
     on_upload_progress: UploadProgressFn | None = None

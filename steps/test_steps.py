@@ -35,8 +35,18 @@ def _safe_pkill_snippet(pattern: str) -> str:
     ).strip()
 
 
-def _run_remote_script(ctx: AppContext, script_body: str, script_name: str):
-    """把脚本落到容器内再执行，避免 bash -lc 命令行含路径导致 pkill 误杀。"""
+def _run_remote_script(
+    ctx: AppContext,
+    script_body: str,
+    script_name: str,
+    timeout: int = 120,
+):
+    """把脚本落到容器内再执行，避免 bash -lc 命令行含路径导致 pkill 误杀。
+
+    域控容器通常把宿主机 /tmp bind-mount 进容器，写宿主机 /tmp 后容器内已可见；
+    ``docker cp`` 在 jtop.sock 挂载异常时会误报失败，故优先直接 exec，
+    仅当容器内文件不存在时再尝试 docker cp。
+    """
     from core.ssh_client import ExecResult
 
     remote_host = f"/tmp/{script_name}"
@@ -53,30 +63,51 @@ def _run_remote_script(ctx: AppContext, script_body: str, script_name: str):
             f"容器未就绪（常见于 jtop.sock 挂载异常）: {exc}",
         )
     user = (ctx.ssh.container_user or "admin").strip() or "admin"
-    cp = ctx.ssh.exec_host(
-        f"docker cp {remote_host} {name}:{remote_ctr}",
+    # /tmp 多为 bind-mount：宿主机已写入则容器内直接可用
+    exists = ctx.ssh.exec_host(
+        f"docker exec -u {user} {name} test -f {remote_ctr}",
         log=None,
-        timeout=60,
+        timeout=30,
         stream_output=False,
     )
-    if not cp.ok:
-        hint = ""
-        low = (cp.combined or "").lower()
-        if "jtop.sock" in low or "not a directory" in low:
-            hint = (
-                "；请在域控宿主机检查: ls -la /run/jtop.sock（应为 socket）。"
-                "若是目录则 sudo rm -rf /run/jtop.sock 后重启 jtop，再 docker start 容器"
+    if not exists.ok:
+        cp = ctx.ssh.exec_host(
+            f"docker cp {remote_host} {name}:{remote_ctr}",
+            log=None,
+            timeout=60,
+            stream_output=False,
+        )
+        if not cp.ok:
+            # docker cp 偶发 jtop 误报：再确认一次文件是否其实已在
+            exists2 = ctx.ssh.exec_host(
+                f"docker exec -u {user} {name} test -f {remote_ctr}",
+                log=None,
+                timeout=30,
+                stream_output=False,
             )
-        return ExecResult(1, "", f"拷贝启动脚本失败: {cp.combined}{hint}")
+            if not exists2.ok:
+                hint = ""
+                low = (cp.combined or "").lower()
+                if "jtop.sock" in low or "not a directory" in low:
+                    hint = (
+                        "；请在域控宿主机检查: ls -la /run/jtop.sock（应为 socket）。"
+                        "若是目录则 sudo rm -rf /run/jtop.sock 后重启 jtop，再 docker start 容器"
+                    )
+                return ExecResult(1, "", f"拷贝启动脚本失败: {cp.combined}{hint}")
     return ctx.ssh.exec_host(
         f"docker exec -u {user} {name} bash {remote_ctr}",
         log=None,
-        timeout=120,
+        timeout=timeout,
         stream_output=False,
     )
 
 
-def _run_local_script(local: LocalDocker, script_body: str, script_name: str):
+def _run_local_script(
+    local: LocalDocker,
+    script_body: str,
+    script_name: str,
+    timeout: int = 120,
+):
     """本机容器：写临时脚本再 docker exec bash 文件。"""
     import subprocess
     import tempfile
@@ -103,7 +134,7 @@ def _run_local_script(local: LocalDocker, script_body: str, script_name: str):
             ["docker", "exec", "-u", user, local.container_name, "bash", ctr_path],
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=timeout,
         )
         return ExecResult(run.returncode, run.stdout or "", run.stderr or "")
     except Exception as exc:  # noqa: BLE001
@@ -236,6 +267,7 @@ def _cyclonedds_xml(own_ip: str, peer_ip: str) -> str:
                     <EnableTopicDiscoveryEndpoints>true</EnableTopicDiscoveryEndpoints>
                     <MaxAutoParticipantIndex>200</MaxAutoParticipantIndex>
                     <Peers>
+                        <Peer address="{own_ip}"/>
                         <Peer address="{peer_ip}"/>
                     </Peers>
                 </Discovery>
@@ -304,6 +336,50 @@ def _bridge_env(ctx: AppContext) -> str:
         f"export ROS_DOMAIN_ID={did}; "
         f"export ROS_LOCALHOST_ONLY=0"
     )
+
+
+def _daemon_stop_start_cmd(source: str, env: str) -> str:
+    """在已 source + export 的环境里 stop/start ros2 daemon，使新 DDS/domain 生效。"""
+    return textwrap.dedent(
+        f"""
+        set +e
+        {source}
+        {env}
+        [ -f /usr/local/mw/setup.bash ] && source /usr/local/mw/setup.bash
+        echo "RMW_IMPLEMENTATION=$RMW_IMPLEMENTATION"
+        echo "CYCLONEDDS_URI=$CYCLONEDDS_URI"
+        echo "ROS_DOMAIN_ID=$ROS_DOMAIN_ID"
+        ros2 daemon stop
+        # start 会带上当前环境，避免冒烟仍走旧 DDS Peer/domain
+        ros2 daemon start
+        echo DAEMON_RESTART_OK
+        """
+    ).strip()
+
+
+def _restart_bridge_daemons(
+    ctx: AppContext,
+    local: LocalDocker,
+    log: LogFn,
+    logs: list[str],
+) -> str | None:
+    """写入互通 DDS 后重启两边 daemon。失败返回错误信息，成功返回 None。"""
+    source = ctx.source_ws()
+    env = _bridge_env(ctx)
+    cmd = _daemon_stop_start_cmd(source, env)
+
+    log("—— 域控重启 ros2 daemon（应用新 DDS）——")
+    r_dc = ctx.ssh.exec_docker(cmd, log=log, timeout=120, stream_output=True)
+    logs.append(r_dc.combined)
+    if "DAEMON_RESTART_OK" not in (r_dc.combined or ""):
+        return f"域控 ros2 daemon 重启失败 (exit={r_dc.exit_code})"
+
+    log("—— 本机重启 ros2 daemon（应用新 DDS）——")
+    r_pc = local.exec(cmd, log=log, timeout=120, stream_output=True)
+    logs.append(r_pc.combined)
+    if "DAEMON_RESTART_OK" not in (r_pc.combined or ""):
+        return f"本机 ros2 daemon 重启失败 (exit={r_pc.exit_code})"
+    return None
 
 
 class ChassisTopicTestStep(TestStep):
@@ -442,7 +518,7 @@ class DdsBridgeStep(TestStep):
             title="域控↔本机 DDS/ROS 互通",
             description=(
                 "备份后改写两边 cyclonedds：按 IP address 绑定 + 互为 Peer；"
-                "ROS_DOMAIN_ID 对齐；可选 talker/listener 冒烟"
+                "ROS_DOMAIN_ID 对齐；重启两边 ros2 daemon 后 talker/listener 冒烟"
             ),
             category="test",
             dangerous=True,
@@ -565,6 +641,11 @@ class DdsBridgeStep(TestStep):
         ctx.ssh.exec_host(f'echo READY > "{bak_marker}"', log=None, timeout=30, stream_output=False)
         (local_bak / "READY").write_text("READY\n", encoding="utf-8")
 
+        # —— 2.5 重启两边 ros2 daemon，避免 listener 仍走旧 Peer/domain ——
+        daemon_err = _restart_bridge_daemons(ctx, local, log, logs)
+        if daemon_err:
+            return StepResult(False, daemon_err, "\n".join(logs))
+
         # —— 3 冒烟：域控 talker + 本机 listener ——
         log("—— 冒烟：域控 talker / 本机 listener（约 20s）——")
         env = _bridge_env(ctx)
@@ -581,9 +662,11 @@ class DdsBridgeStep(TestStep):
             sleep 1
             rm -f /tmp/k15_bridge_talker.log /tmp/k15_bridge_talker.pid
             setsid ros2 run demo_nodes_cpp talker >/tmp/k15_bridge_talker.log 2>&1 </dev/null &
-            sleep 2
+            sleep 3
             if pgrep -x talker >/dev/null; then
               pgrep -x talker | head -1 > /tmp/k15_bridge_talker.pid
+              # 再等 1s 让 SPDP 出去
+              sleep 1
               echo TALKER_STARTED
               exit 0
             fi
@@ -603,16 +686,34 @@ class DdsBridgeStep(TestStep):
             {source}
             {env}
             [ -f /usr/local/mw/setup.bash ] && source /usr/local/mw/setup.bash
-            timeout 15 ros2 topic echo /chatter --once 2>&1 | tee /tmp/k15_bridge_listener.log
+            # 带 daemon 时常出现「/chatter 已在域控发布，本机 topic list 却看不到」；
+            # 独立进程 + 足够 discovery 等待更稳。
+            ros2 daemon stop >/dev/null 2>&1 || true
+            # 先等 talker 发现窗口，再 echo
+            found=0
+            for i in $(seq 1 15); do
+              if timeout 3 ros2 topic list --no-daemon --spin-time 2 2>/dev/null | grep -qx /chatter; then
+                found=1
+                echo "CHATTER_FOUND after ${{i}} try"
+                break
+              fi
+              sleep 1
+            done
+            if [ "$found" != 1 ]; then
+              echo "CHATTER_NOT_IN_TOPIC_LIST"
+              timeout 5 ros2 topic list --no-daemon --spin-time 3 2>&1 | head -40 || true
+            fi
+            timeout 35 ros2 topic echo /chatter --once --no-daemon --spin-time 30 2>&1 | tee /tmp/k15_bridge_listener.log
             if grep -qiE 'Hello World|data:' /tmp/k15_bridge_listener.log; then
               echo BRIDGE_PASS
               exit 0
             fi
             echo BRIDGE_FAIL
+            echo "--- talker side hint: check /tmp/k15_bridge_talker.log on DC ---"
             exit 1
             """
         ).strip()
-        l_res = local.exec(listen, log=log, timeout=60, stream_output=True)
+        l_res = local.exec(listen, log=log, timeout=120, stream_output=True)
         logs.append(l_res.combined)
 
         ctx.ssh.exec_docker(
@@ -708,8 +809,23 @@ class JointLatencyTestStep(TestStep):
 
         banner_parallel_start(status)
 
-        # —— 快速启动 Controller（不等长日志）——
-        # 经脚本文件启动，避免 docker exec bash -lc 命令行触发 pkill 误杀
+        # —— 启动 Controller，并等到 /joint_states 真正在发 ——
+        # 仅 sleep 3s 不够：硬件 activate（腰/头/双臂）常需 20～40s；
+        # 头电机 CSP 失败时进程会随后退出，MoveIt 会报 joint state 超时。
+        status("同步时钟并清理旧 Controller…")
+        _ = ctx.ssh.exec_docker(
+            "chronyc -a makestep 2>/dev/null || true; date -Is",
+            log=None,
+            timeout=30,
+            stream_output=False,
+        )
+        _ = local.exec(
+            "chronyc -a makestep 2>/dev/null || true; date -Is",
+            log=None,
+            timeout=30,
+            stream_output=False,
+        )
+
         status("启动域控 Controller…")
         ctrl_pat = r"/opt/ros/.*/bin/ros2 [l]aunch .*controller[.]launch[.]py"
         ctrl_script = textwrap.dedent(
@@ -720,9 +836,22 @@ class JointLatencyTestStep(TestStep):
             {source}
             {env}
             [ -f /usr/local/mw/setup.bash ] && source /usr/local/mw/setup.bash
+            # 彻底清理，避免 CAN/EtherCAT 被旧进程占用导致 Head CSP 失败
             {_safe_pkill_snippet(ctrl_pat)}
+            {_safe_pkill_snippet(r"[r]os2_control_node")}
+            {_safe_pkill_snippet(r"[s]pawner ")}
             if [ -f /tmp/k15_controller.pid ]; then
               kill $(cat /tmp/k15_controller.pid) 2>/dev/null || true
+              sleep 1
+              kill -9 $(cat /tmp/k15_controller.pid) 2>/dev/null || true
+            fi
+            # 给头 CAN / 腰 EtherCAT 释放总线一点时间
+            sleep 5
+            # 可选：复位 can0（失败忽略）
+            if ip link show can0 >/dev/null 2>&1; then
+              sudo ip link set can0 down 2>/dev/null || true
+              sudo ip link set can0 up type can bitrate 1000000 2>/dev/null \\
+                || sudo ip link set can0 up 2>/dev/null || true
             fi
             sleep 1
             : > {self.CTRL_LOG}
@@ -741,7 +870,7 @@ class JointLatencyTestStep(TestStep):
               exit 0
             fi
             echo CONTROLLER_FAILED
-            tail -n 40 {self.CTRL_LOG} || true
+            tail -n 60 {self.CTRL_LOG} || true
             exit 1
             """
         ).strip()
@@ -749,10 +878,136 @@ class JointLatencyTestStep(TestStep):
         logs.append(ctrl.combined)
         if "CONTROLLER_STARTED" not in ctrl.combined:
             status("Controller 启动失败")
-            for ln in (ctrl.combined or "").splitlines()[-30:]:
+            for ln in (ctrl.combined or "").splitlines()[-40:]:
                 clog("controller", ln)
             return StepResult(False, "域控 Controller 启动失败，见日志", "\n".join(logs))
-        status("Controller 已后台运行")
+        status("Controller 进程已拉起，等待 /joint_states 就绪…")
+
+        # 轮询：进程仍在 + joint_states 真正在发（最长约 90s）
+        # 注意：无类型的 ``ros2 topic echo --once`` 在 CycloneDDS 下常因 topic
+        # discovery 未就绪误报；改用 typed echo / hz / list_controllers 三重判定。
+        wait_js = textwrap.dedent(
+            f"""
+            #!/bin/bash
+            set +e
+            cd /anyverse
+            {source}
+            {env}
+            [ -f /usr/local/mw/setup.bash ] && source /usr/local/mw/setup.bash
+            ros2 daemon stop >/dev/null 2>&1 || true
+            ros2 daemon start >/dev/null 2>&1 || true
+            sleep 1
+            deadline=$(( $(date +%s) + 90 ))
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+              if ! pgrep -f '{ctrl_pat}' >/dev/null; then
+                echo CONTROLLER_DIED
+                echo "----- controller log (tail) -----"
+                tail -n 80 {self.CTRL_LOG} || true
+                if grep -qE "Failed to set CSP mode|Failed to .activate. hardware .HeadHardware" {self.CTRL_LOG} 2>/dev/null; then
+                  echo HEAD_CSP_FAIL
+                fi
+                exit 1
+              fi
+              # 1) typed echo（不依赖 topic discovery 推断类型）
+              out=$(timeout 4 ros2 topic echo /joint_states sensor_msgs/msg/JointState --once 2>/dev/null | head -25 || true)
+              if echo "$out" | grep -qE "position:|name:"; then
+                echo JOINT_STATES_READY
+                echo "$out" | head -12
+                exit 0
+              fi
+              # 2) hz：有 average rate 即说明在发
+              hz=$(timeout 3 ros2 topic hz /joint_states 2>&1 | head -8 || true)
+              if echo "$hz" | grep -q "average rate"; then
+                echo JOINT_STATES_READY
+                echo "$hz" | head -4
+                exit 0
+              fi
+              # 3) controller 已 active（hardware 起来且 broadcaster 在跑）
+              ctrl=$(timeout 5 ros2 control list_controllers 2>/dev/null || true)
+              if echo "$ctrl" | grep -qE "joint_state_broadcaster[[:space:]].*active"; then
+                echo JOINT_STATES_READY
+                echo "$ctrl" | head -12
+                exit 0
+              fi
+              if grep -qE "Failed to set CSP mode|Failed to .activate. hardware .HeadHardware" {self.CTRL_LOG} 2>/dev/null; then
+                echo HEAD_CSP_FAIL
+                tail -n 40 {self.CTRL_LOG} || true
+                exit 1
+              fi
+              sleep 2
+            done
+            echo JOINT_STATES_TIMEOUT
+            tail -n 60 {self.CTRL_LOG} || true
+            exit 1
+            """
+        ).strip()
+        js = _run_remote_script(ctx, wait_js, "k15_wait_joint_states.sh", timeout=150)
+        logs.append(js.combined)
+        for ln in (js.combined or "").splitlines()[-50:]:
+            clog("controller", ln)
+        if "JOINT_STATES_READY" not in js.combined:
+            status("Controller 未产出 /joint_states")
+            hint = ""
+            if "HEAD_CSP_FAIL" in js.combined:
+                hint = (
+                    "（头电机 CSP 模式切换失败：请检查 can0 / 头部供电，"
+                    "断电重启头或整机后再试）"
+                )
+            elif "CONTROLLER_DIED" in js.combined:
+                hint = "（Controller 进程已退出，见 Controller 栏日志）"
+            return StepResult(
+                False,
+                f"域控 /joint_states 未就绪{hint}",
+                "\n".join(logs),
+            )
+        status("Controller 已就绪（/joint_states 正常）")
+
+        # —— 本机须先看到域控 /joint_states（依赖 DDS 互通）——
+        status("检查本机是否可见域控 /joint_states…")
+        pc_js = textwrap.dedent(
+            f"""
+            #!/bin/bash
+            set +e
+            cd /anyverse
+            {source}
+            {env}
+            [ -f /usr/local/mw/setup.bash ] && source /usr/local/mw/setup.bash
+            ros2 daemon stop >/dev/null 2>&1 || true
+            ros2 daemon start >/dev/null 2>&1 || true
+            sleep 1
+            deadline=$(( $(date +%s) + 45 ))
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+              out=$(timeout 4 ros2 topic echo /joint_states sensor_msgs/msg/JointState --once 2>/dev/null | head -20 || true)
+              if echo "$out" | grep -qE "position:|name:"; then
+                echo PC_JOINT_STATES_OK
+                echo "$out" | head -8
+                exit 0
+              fi
+              hz=$(timeout 3 ros2 topic hz /joint_states 2>&1 | head -6 || true)
+              if echo "$hz" | grep -q "average rate"; then
+                echo PC_JOINT_STATES_OK
+                echo "$hz" | head -3
+                exit 0
+              fi
+              sleep 2
+            done
+            echo PC_JOINT_STATES_MISSING
+            timeout 5 ros2 topic list 2>&1 | head -30 || true
+            exit 1
+            """
+        ).strip()
+        pc_check = _run_local_script(
+            local, pc_js, "k15_pc_wait_joint_states.sh", timeout=90
+        )
+        logs.append(pc_check.combined)
+        if "PC_JOINT_STATES_OK" not in pc_check.combined:
+            status("本机看不到域控 /joint_states")
+            return StepResult(
+                False,
+                "本机收不到域控 /joint_states：请先执行「域控↔本机 DDS/ROS 互通」后再测关节时延",
+                "\n".join(logs),
+            )
+        status("本机已收到 /joint_states")
 
         # —— 快速启动 MoveIt Demo ——
         status("启动本机 MoveIt Demo…")
@@ -810,14 +1065,33 @@ class JointLatencyTestStep(TestStep):
         up = ctx.ssh.write_remote_file(self.REMOTE_SCRIPT, content, sudo=False, log=None)
         if not up.ok:
             return StepResult(False, "上传时延脚本失败", "\n".join(logs) + "\n" + up.combined)
-        cp = ctx.ssh.exec_host(
-            f"docker cp {self.REMOTE_SCRIPT} {dc_name}:{self.REMOTE_SCRIPT}",
+        # /tmp 多为 bind-mount：宿主机写入后容器内已可见；docker cp 遇 jtop 可能误报
+        exists = ctx.ssh.exec_host(
+            f"docker exec -u {dc_user} {dc_name} test -f {self.REMOTE_SCRIPT}",
             log=None,
-            timeout=60,
+            timeout=30,
             stream_output=False,
         )
-        if not cp.ok:
-            return StepResult(False, "拷贝时延脚本到容器失败", "\n".join(logs) + "\n" + cp.combined)
+        if not exists.ok:
+            cp = ctx.ssh.exec_host(
+                f"docker cp {self.REMOTE_SCRIPT} {dc_name}:{self.REMOTE_SCRIPT}",
+                log=None,
+                timeout=60,
+                stream_output=False,
+            )
+            if not cp.ok:
+                exists2 = ctx.ssh.exec_host(
+                    f"docker exec -u {dc_user} {dc_name} test -f {self.REMOTE_SCRIPT}",
+                    log=None,
+                    timeout=30,
+                    stream_output=False,
+                )
+                if not exists2.ok:
+                    return StepResult(
+                        False,
+                        "拷贝时延脚本到容器失败",
+                        "\n".join(logs) + "\n" + cp.combined,
+                    )
 
         # 只按旧 pid 结束，避免在 bash -lc 里 pgrep python 路径；经脚本文件启动
         lat_start = textwrap.dedent(

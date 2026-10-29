@@ -32,7 +32,7 @@ class TestStep:
     id: str
     title: str
     description: str
-    category: str  # env | test
+    category: str  # deploy | env | test
     dangerous: bool = False
     needs_manual: bool = False
     status: StepStatus = StepStatus.PENDING
